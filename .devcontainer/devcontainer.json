@@ -5,6 +5,7 @@
   "onCreateCommand": "bash .devcontainer/onCreate.sh",
   "waitFor": "onCreateCommand",
 
+  "postStartCommand": "bash .devcontainer/start-drillui.sh",
   "postAttachCommand": "bash .devcontainer/start-drillui.sh",
 
   "hostRequirements": {

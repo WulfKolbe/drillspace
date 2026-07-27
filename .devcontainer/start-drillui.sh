@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Start drillui on the bundled sample and leave it running.
 #
-# Runs as postAttachCommand, so it fires every time the codespace is attached
-# (including a resume from stopped) — unlike onCreateCommand, which a prebuild
-# has already executed and which therefore never runs for the visitor.
+# Wired to BOTH postStartCommand and postAttachCommand, deliberately:
+#
+#   - postStartCommand runs whenever the container starts, with no client
+#     involved. This is the one that matters: a codespace created or resumed
+#     without an editor attached (gh codespace create, a port-forward, an API
+#     call) still ends up with the bridge listening.
+#   - postAttachCommand covers the case where a client attaches to a container
+#     that was already running when the bridge was not — e.g. after someone
+#     killed it by hand.
+#
+# Running twice is harmless: the port check below turns the second call into a
+# no-op. Neither hook is onCreateCommand, which a prebuild has already executed
+# and which therefore never runs for a visitor.
 #
 # Port 8787 is set to onAutoForward "openBrowser" in devcontainer.json, so the
 # moment this bridge binds, VS Code opens the terminal UI in the user's browser.
