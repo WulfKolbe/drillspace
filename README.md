@@ -10,10 +10,9 @@ Ask it something, or type a pdfdrill command name (`report`, `model`,
 `compare`, `latex`, …) to run it on the open document. Outputs appear in the
 panel on the right. Drag your own PDF into the file explorer to switch to it.
 
-> Asking free-form questions calls the `claude` CLI; running pdfdrill commands
-> does not. A cold codespace installs ~4 GB of TeXLive before it is usable —
-> once per codespace, or once per repo with a
-> [prebuild](https://docs.github.com/en/codespaces/prebuilding-your-codespaces/about-github-codespaces-prebuilds).
+> The container is [prebuilt](https://docs.github.com/en/codespaces/prebuilding-your-codespaces/about-github-codespaces-prebuilds),
+> so the toolchain is baked in rather than installed on launch. Asking
+> free-form questions calls the `claude` CLI; running pdfdrill commands does not.
 
 Start it by hand, or on a different document:
 
