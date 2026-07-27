@@ -53,10 +53,30 @@ disown 2>/dev/null || true
 
 # Confirm it actually bound, rather than reporting success and leaving the user
 # to discover otherwise. This is the check that was missing.
+announce() {
+  # Inside a codespace, http://localhost:8787 on the VISITOR's machine is their
+  # own machine, not this container — the only address that works is the
+  # forwarded one. It is derivable, so print it rather than leaving someone to
+  # discover the Ports panel. VS Code makes the URL clickable in the terminal.
+  local url=""
+  if [ -n "${CODESPACE_NAME:-}" ]; then
+    url="https://${CODESPACE_NAME}-8787.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}/"
+  else
+    url="http://localhost:8787/"
+  fi
+  printf '\n'
+  printf '  ┌──────────────────────────────────────────────────────────────┐\n'
+  printf '  │  drillui is running. Open it here:                           │\n'
+  printf '  └──────────────────────────────────────────────────────────────┘\n'
+  printf '\n    %s\n\n' "$url"
+  printf '  (ctrl/cmd-click the link. localhost:8787 will NOT work from your\n'
+  printf '   own browser — that address is this container, not your machine.)\n\n'
+}
+
 for _ in $(seq 1 20); do
   if (exec 3<>/dev/tcp/127.0.0.1/8787) 2>/dev/null; then
     exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
-    echo "drillui listening on :8787 for $DOC"
+    announce
     exit 0
   fi
   sleep 1

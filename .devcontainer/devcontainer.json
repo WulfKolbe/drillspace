@@ -16,7 +16,13 @@
   "onCreateCommand": "bash .devcontainer/onCreate.sh",
   "waitFor": "onCreateCommand",
 
-  "postStartCommand": "bash .devcontainer/start-drillui.sh",
+  // postAttachCommand ONLY — deliberately not postStartCommand.
+  //
+  // Port 8787 is set to onAutoForward "openBrowser", and VS Code fires that
+  // when it detects a port opening WHILE ATTACHED. A bridge started at
+  // container start (postStartCommand) is already listening before the editor
+  // connects, so there is nothing to detect and the browser never opens — the
+  // visitor is left to find the Ports panel on their own.
   "postAttachCommand": "bash .devcontainer/start-drillui.sh",
 
   "hostRequirements": {

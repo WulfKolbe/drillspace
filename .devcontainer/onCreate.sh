@@ -165,6 +165,33 @@ for b in bun uv tiddlywiki; do
   fi
 done
 
+# ---- 8/8  suppress the README preview on open ---------------------------
+# devcontainer.json's customizations.vscode.settings land in MACHINE scope, and
+# `workbench.startupEditor` is a USER-scope setting — VS Code silently ignores
+# it there. Setting it in devcontainer.json therefore does nothing, and the
+# visitor is greeted by the README instead of the tool. Write it to the User
+# settings file directly, which is the scope that actually governs it.
+step "8/8  VS Code user settings (no README on startup)"
+USER_DIR="$HOME/.vscode-remote/data/User"
+USER_SETTINGS="$USER_DIR/settings.json"
+mkdir -p "$USER_DIR"
+if [ -s "$USER_SETTINGS" ]; then
+  python3 - "$USER_SETTINGS" <<'PY' || echo "  (could not merge — leaving existing settings alone)"
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(1)
+d["workbench.startupEditor"] = "none"
+json.dump(d, open(p, "w"), indent=2)
+print("  merged startupEditor into existing user settings")
+PY
+else
+  printf '{\n  "workbench.startupEditor": "none"\n}\n' > "$USER_SETTINGS"
+  echo "  wrote $USER_SETTINGS"
+fi
+
 printf '\n%s\n' "----------------------------------------------------------------"
 echo " provisioning finished. Verify with:"
 echo "     bash .devcontainer/verify.sh"
