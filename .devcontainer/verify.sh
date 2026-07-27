@@ -80,6 +80,20 @@ fi
 echo "── T7  TiddlyWiki on bun ────────────────────────────────────────"
 have T7.1-tiddlywiki  tiddlywiki
 
+echo "── T8  reachable from a CLEAN shell ─────────────────────────────"
+# T1/T7 use whatever PATH this script inherited, so they pass even when a tool
+# is only findable because of the caller's environment. bun, uv and tiddlywiki
+# live under $HOME, off the default PATH — the failure mode that actually bit
+# us was `bun: command not found` in a fresh terminal while provisioning had
+# reported success. These tests inherit NOTHING and so reproduce that case.
+for b in bun uv tiddlywiki; do
+  if env -i bash -c "command -v $b" >/dev/null 2>&1; then
+    ok  "T8-$b"
+  else
+    bad "T8-$b" "not on the default PATH — new terminals will not find it"
+  fi
+done
+
 echo "─────────────────────────────────────────────────────────────────"
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 exit "$FAIL"

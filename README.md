@@ -41,6 +41,12 @@ Independent named tests across runtimes, pdfdrill prerequisites, the LaTeX/SVG
 toolchain, tesseract language data, Python deps, `pdfdrill doctor`, and
 TiddlyWiki. Exit status = number of failures.
 
+The last group (**T8**) is the one worth understanding: it re-resolves `bun`,
+`uv` and `tiddlywiki` in a shell that inherits *nothing*. Every other check
+uses whatever `PATH` the caller happened to have, so a tool can pass there and
+still be missing from a fresh terminal — which is precisely how a
+`bun: command not found` slipped past a provisioning run that reported success.
+
 ### Forwarded ports
 
 | Port | What |

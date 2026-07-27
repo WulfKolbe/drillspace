@@ -9,10 +9,12 @@
     "storage": "32gb"
   },
 
+  "remoteUser": "vscode",
+
   "remoteEnv": {
-    "PATH": "${containerEnv:HOME}/.bun/bin:${containerEnv:HOME}/.local/bin:${containerEnv:PATH}",
+    "PATH": "/home/vscode/.bun/bin:/home/vscode/.local/bin:${containerEnv:PATH}",
     "PYTHONPATH": "${containerWorkspaceFolder}/src",
-    "BUN_INSTALL": "${containerEnv:HOME}/.bun",
+    "BUN_INSTALL": "/home/vscode/.bun",
     "PDFDRILL_PLAYGROUND": "1"
   },
 
