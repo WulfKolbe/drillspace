@@ -2,18 +2,25 @@
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/WulfKolbe/drillspace)
 
-**Click the badge, wait for provisioning, drill.** One container image — no
-Docker Compose, no multi-service orchestration, nothing to install locally.
-The whole toolchain (poppler, ghostscript, TeXLive, tesseract, libvips, bun,
-uv, TiddlyWiki) is baked in by a single `onCreateCommand`.
+**Open it, wait once, drill.** One container image — no Docker Compose, no
+multi-service orchestration, nothing to install locally. The whole toolchain
+(poppler, ghostscript, TeXLive, tesseract, libvips, bun, uv, TiddlyWiki) is
+baked in by a single `onCreateCommand`.
 
 ## Start drilling
 
-1. **Open in Codespaces** — the badge above, or `Code ▾ → Codespaces → Create`.
+1. **Open the playground.** Click the **Open in GitHub Codespaces** button
+   just below the title at the top of this page — or use the plain link
+   <https://codespaces.new/WulfKolbe/drillspace>, or `Code ▾ → Codespaces →
+   Create codespace on main`. All three do the same thing. A full Linux
+   machine with everything installed opens in your browser; you need nothing
+   on your own computer.
 2. **Wait for provisioning.** `.devcontainer/onCreate.sh` runs once. On a
    *prebuilt* codespace this is near-instant; on a cold one it installs the
    full TeXLive set and takes several minutes (see [Prebuilds](#prebuilds)).
-3. **Drill.** `PYTHONPATH` is already set — no `cd`, no venv, no activation:
+   Watch it with F1 → *Codespaces: View Creation Log*.
+3. **Drill.** Open a terminal in that browser window and run the commands
+   below. `PYTHONPATH` is already set — no `cd`, no venv, no activation:
 
 ```bash
 python3 -m pdfdrill report 2305.04710v1.pdf     # offline math report, no API key
