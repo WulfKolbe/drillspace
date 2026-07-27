@@ -144,7 +144,7 @@ else
   echo "  appended PATH block to ~/.bashrc"
 fi
 
-for t in "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bunx" \
+for t in "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bunx" "$HOME/.local/bin/claude" \
          "$HOME/.local/bin/uv" "$HOME/.local/bin/uvx" \
          "$HOME/.bun/bin/tiddlywiki"; do
   [ -x "$t" ] || continue
@@ -164,6 +164,32 @@ for b in bun uv tiddlywiki; do
     echo "      MISS $b   (only reachable with this script's PATH)"
   fi
 done
+
+# ---- 7b/8  the claude CLI (drillui's LLM transport) ---------------------
+# drillui_chat routes a free-form question through `claude -p`. Without the
+# binary the REPL answers every non-command with
+# "No such file or directory: 'claude'". pdfdrill COMMANDS never need it, so
+# a failure here degrades the playground rather than breaking it.
+#
+# Authentication is NOT done here and cannot be: it is interactive and
+# per-user. The visitor runs `claude` once in the terminal to log in.
+step "7b/8  claude CLI"
+if command -v claude >/dev/null 2>&1; then
+  echo "  claude already present: $(claude --version 2>&1 | head -1)"
+else
+  curl -fsSL https://claude.ai/install.sh | bash \
+    || { echo "  native installer failed — trying bun"; bun add --global @anthropic-ai/claude-code; } \
+    || echo "  (claude install failed — questions unavailable, commands unaffected)"
+  # The native installer drops it in ~/.local/bin, bun in ~/.bun/bin; both are
+  # covered by the symlink pass below, but link it now so this script can
+  # report the truth rather than a guess.
+  for c in "$HOME/.local/bin/claude" "$HOME/.bun/bin/claude"; do
+    [ -x "$c" ] && $SUDO ln -sf "$c" /usr/local/bin/claude 2>/dev/null && break
+  done
+  command -v claude >/dev/null 2>&1 \
+    && echo "  claude $(claude --version 2>&1 | head -1)" \
+    || echo "  !! claude NOT installed — pdfdrill commands still work; questions will not."
+fi
 
 # ---- 8/8  suppress the README preview on open ---------------------------
 # devcontainer.json's customizations.vscode.settings land in MACHINE scope, and
