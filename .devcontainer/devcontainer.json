@@ -46,7 +46,8 @@
         "James-Yu.latex-workshop"
       ],
       "settings": {
-        "terminal.integrated.defaultProfile.linux": "bash"
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "workbench.startupEditor": "none"
       }
     }
   }
