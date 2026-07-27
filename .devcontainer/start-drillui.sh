@@ -58,9 +58,19 @@ announce() {
   # own machine, not this container — the only address that works is the
   # forwarded one. It is derivable, so print it rather than leaving someone to
   # discover the Ports panel. VS Code makes the URL clickable in the terminal.
+  # CODESPACE_NAME is exported into VS Code's own terminals but NOT into every
+  # shell (an ssh session, for one), and this banner is worthless if it degrades
+  # to a localhost URL that cannot work. The codespace agent always writes the
+  # name to a file, so fall back to that before giving up.
+  local name="${CODESPACE_NAME:-}" domain="${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
+  local envfile=/workspaces/.codespaces/shared/environment-variables.json
+  if [ -z "$name" ] && [ -r "$envfile" ]; then
+    name="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("CODESPACE_NAME",""))' "$envfile" 2>/dev/null)"
+  fi
+
   local url=""
-  if [ -n "${CODESPACE_NAME:-}" ]; then
-    url="https://${CODESPACE_NAME}-8787.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}/"
+  if [ -n "$name" ]; then
+    url="https://${name}-8787.${domain}/"
   else
     url="http://localhost:8787/"
   fi
