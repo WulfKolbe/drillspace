@@ -2,6 +2,17 @@
   "name": "pdfdrill playground",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
 
+  // Without an SSH server in the container, `gh codespace ssh` and
+  // `gh codespace logs` both fail outright, so a codespace that misbehaves
+  // cannot be inspected from outside at all — no logs, no shell, no way to
+  // see whether a lifecycle hook ran. This feature is what makes the
+  // playground debuggable remotely.
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    }
+  },
+
   "onCreateCommand": "bash .devcontainer/onCreate.sh",
   "waitFor": "onCreateCommand",
 
