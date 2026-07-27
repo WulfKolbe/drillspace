@@ -1,82 +1,44 @@
 # drillspace — the pdfdrill playground
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/WulfKolbe/drillspace)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/WulfKolbe/drillspace?quickstart=1)
 
-**Open it, wait once, drill.** One container image — no Docker Compose, no
-multi-service orchestration, nothing to install locally. The whole toolchain
-(poppler, ghostscript, TeXLive, tesseract, libvips, bun, uv, TiddlyWiki) is
-baked in by a single `onCreateCommand`.
+**Two clicks, then drill.** Click the badge, wait for the codespace, and
+**drillui opens in your browser** on a sample paper that is already drilled —
+nothing to install, no command to type.
 
-## Start drilling
+Ask it something, or type a pdfdrill command name (`report`, `model`,
+`compare`, `latex`, …) to run it on the open document. Outputs appear in the
+panel on the right. Drag your own PDF into the file explorer to switch to it.
 
-**1.** Click the **Open in GitHub Codespaces** button just below the title at
-the top of this page. A full Linux machine opens in your browser — nothing is
-installed on your own computer.
+> Asking free-form questions calls the `claude` CLI; running pdfdrill commands
+> does not. A cold codespace installs ~4 GB of TeXLive before it is usable —
+> once per codespace, or once per repo with a
+> [prebuild](https://docs.github.com/en/codespaces/prebuilding-your-codespaces/about-github-codespaces-prebuilds).
 
-**2.** When the terminal appears, type one line:
-
-```bash
-python3 -m pdfdrill report 2305.04710v1.pdf
-```
-
-That's the whole first run. It reads a bundled sample paper and prints an
-offline math report — no API key, no setup, no configuration.
-
-Then try it on your own document: drag a PDF into the file explorer on the
-left and run the same command with your filename. Three more samples are
-already there (`1802.08153.pdf`, `2601.07372.pdf`,
-`subq-1-1-small-model-card.pdf`).
-
-`python3 -m pdfdrill help` lists everything else.
-
-> **First time may be slow.** On a cold codespace, provisioning installs a
-> full TeX distribution before the terminal is usable. That happens once —
-> see [Prebuilds](#prebuilds) for how to make it near-instant.
-
-## If something looks wrong
+Start it by hand, or on a different document:
 
 ```bash
-bash .devcontainer/verify.sh
+bash .devcontainer/start-drillui.sh            # the bundled sample
+DRILLUI_DOC=my.pdf bash .devcontainer/start-drillui.sh
 ```
 
-Checks every part of the toolchain and exits with the number of failures. You
-do **not** need to run this to start drilling — it is a diagnostic for when
-something misbehaves. Details in
+If something misbehaves: `bash .devcontainer/verify.sh` checks the toolchain
+and exits with the number of failures. Details in
 [`.devcontainer/README.md`](.devcontainer/README.md).
 
 ## Forwarded ports
 
-Nothing starts these automatically; they open when you run the corresponding
-tool.
-
 | Port | What |
 |------|------|
-| 8787 | drillui — ask-the-document terminal (`bun tools/drillui_bridge.ts`) |
+| 8787 | drillui — opens automatically |
 | 8080 | TiddlyWiki, hosted by bun |
 | 10000 | drillui artifacts (static) |
-
-## Prebuilds
-
-Provisioning installs ~4 GB of TeXLive. That cost is paid **once** if the
-repository has a Codespaces prebuild configured — which is exactly why the
-setup lives in `onCreateCommand` and not `postCreateCommand`
-(`postCreateCommand` re-runs on every creation and would defeat the prebuild).
-
-Configure at **Settings → Codespaces → Set up prebuild**. Without it, every
-new codespace pays the full install time.
-
-> Note: a **fork** does not inherit this repository's prebuilds. For the
-> fastest start, create the codespace on this repo directly rather than on a
-> fork.
 
 ## What this repo is
 
 A snapshot of [`WulfKolbe/pdfdrill`](https://github.com/WulfKolbe/pdfdrill)
-(commit `d9f3dc2`, 2026-07-27) plus a `.devcontainer/` that turns it into a
-one-click playground. It carries **fresh git history** — none of the upstream
-history is included.
-
-For upstream development, issues, and the canonical source, use
+plus a `.devcontainer/` that turns it into a playground. It carries fresh git
+history. For development, issues, and the canonical source, use
 [`WulfKolbe/pdfdrill`](https://github.com/WulfKolbe/pdfdrill). Everything below
 is that project's own documentation.
 
