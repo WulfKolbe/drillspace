@@ -9,45 +9,45 @@ baked in by a single `onCreateCommand`.
 
 ## Start drilling
 
-1. **Open the playground.** Click the **Open in GitHub Codespaces** button
-   just below the title at the top of this page — or use the plain link
-   <https://codespaces.new/WulfKolbe/drillspace>, or `Code ▾ → Codespaces →
-   Create codespace on main`. All three do the same thing. A full Linux
-   machine with everything installed opens in your browser; you need nothing
-   on your own computer.
-2. **Wait for provisioning.** `.devcontainer/onCreate.sh` runs once. On a
-   *prebuilt* codespace this is near-instant; on a cold one it installs the
-   full TeXLive set and takes several minutes (see [Prebuilds](#prebuilds)).
-   Watch it with F1 → *Codespaces: View Creation Log*.
-3. **Drill.** Open a terminal in that browser window and run the commands
-   below. `PYTHONPATH` is already set — no `cd`, no venv, no activation:
+**1.** Click the **Open in GitHub Codespaces** button just below the title at
+the top of this page. A full Linux machine opens in your browser — nothing is
+installed on your own computer.
+
+**2.** When the terminal appears, type one line:
 
 ```bash
-python3 -m pdfdrill report 2305.04710v1.pdf     # offline math report, no API key
-python3 -m pdfdrill doctor                      # what's installed, what isn't
+python3 -m pdfdrill report 2305.04710v1.pdf
 ```
 
-Four sample PDFs ship in the repo root (`1802.08153.pdf`, `2305.04710v1.pdf`,
-`2601.07372.pdf`, `subq-1-1-small-model-card.pdf`), so there is something to
-drill the second the container is up.
+That's the whole first run. It reads a bundled sample paper and prints an
+offline math report — no API key, no setup, no configuration.
 
-### Check the container is sound
+Then try it on your own document: drag a PDF into the file explorer on the
+left and run the same command with your filename. Three more samples are
+already there (`1802.08153.pdf`, `2601.07372.pdf`,
+`subq-1-1-small-model-card.pdf`).
+
+`python3 -m pdfdrill help` lists everything else.
+
+> **First time may be slow.** On a cold codespace, provisioning installs a
+> full TeX distribution before the terminal is usable. That happens once —
+> see [Prebuilds](#prebuilds) for how to make it near-instant.
+
+## If something looks wrong
 
 ```bash
 bash .devcontainer/verify.sh
 ```
 
-Independent named tests across runtimes, pdfdrill prerequisites, the LaTeX/SVG
-toolchain, tesseract language data, Python deps, `pdfdrill doctor`, and
-TiddlyWiki. Exit status = number of failures.
+Checks every part of the toolchain and exits with the number of failures. You
+do **not** need to run this to start drilling — it is a diagnostic for when
+something misbehaves. Details in
+[`.devcontainer/README.md`](.devcontainer/README.md).
 
-The last group (**T8**) is the one worth understanding: it re-resolves `bun`,
-`uv` and `tiddlywiki` in a shell that inherits *nothing*. Every other check
-uses whatever `PATH` the caller happened to have, so a tool can pass there and
-still be missing from a fresh terminal — which is precisely how a
-`bun: command not found` slipped past a provisioning run that reported success.
+## Forwarded ports
 
-### Forwarded ports
+Nothing starts these automatically; they open when you run the corresponding
+tool.
 
 | Port | What |
 |------|------|
