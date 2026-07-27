@@ -42,5 +42,24 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 [ -f "$DOC" ] || { echo "sample $DOC missing — skipping drillui autostart"; exit 0; }
 
-nohup bun tools/drillui_bridge.ts "$DOC" --host 0.0.0.0 >"$LOG" 2>&1 &
-echo "drillui starting on :8787 for $DOC  (log: $LOG)"
+# setsid, not just nohup. A lifecycle hook's shell exits as soon as the script
+# returns, and the codespace agent tears down that process group — which killed
+# the bridge every time, leaving a 0-byte log and nothing on 8787. setsid puts
+# the bridge in its OWN session so it survives; </dev/null detaches stdin, which
+# a background process without a terminal otherwise blocks on.
+setsid nohup bun tools/drillui_bridge.ts "$DOC" --host 0.0.0.0 \
+  </dev/null >"$LOG" 2>&1 &
+disown 2>/dev/null || true
+
+# Confirm it actually bound, rather than reporting success and leaving the user
+# to discover otherwise. This is the check that was missing.
+for _ in $(seq 1 20); do
+  if (exec 3<>/dev/tcp/127.0.0.1/8787) 2>/dev/null; then
+    exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+    echo "drillui listening on :8787 for $DOC"
+    exit 0
+  fi
+  sleep 1
+done
+echo "drillui did NOT bind :8787 within 20s — see $LOG"
+tail -20 "$LOG" 2>/dev/null
