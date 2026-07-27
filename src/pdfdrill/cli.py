@@ -1,0 +1,1831 @@
+"""pdfdrill CLI — flat commands, prose output, sidecar persistence.
+
+Each command does one thing, returns prose the LLM can quote directly.
+State persists in paper.pdf.drill.json next to the PDF.
+
+Usage:
+    pdfdrill size paper.pdf
+    pdfdrill abstract paper.pdf
+    pdfdrill toc paper.pdf
+    pdfdrill fonts paper.pdf
+    pdfdrill status paper.pdf
+    pdfdrill md paper.pdf [--pages 3-7]
+    pdfdrill page paper.pdf 5
+    pdfdrill fetch paper.pdf md [--section 3]
+    pdfdrill plan paper.pdf "What theorem is proved?"
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _reassemble_spaced_path(rest: list) -> list:
+    """The shell splits an UNQUOTED filename with spaces into several args. If a
+    leading run of non-flag args joins (with spaces) into an existing local file,
+    collapse that run into ONE arg so the handler sees the whole path. The LONGEST
+    existing prefix wins, so a trailing positional (e.g. a page number) survives.
+    No-op when args[0] is a flag/URL or already resolves (a correctly-quoted path)."""
+    if not rest or rest[0].startswith("-"):
+        return rest
+    from . import sources
+    if sources.is_url(rest[0]) or Path(rest[0]).expanduser().exists():
+        return rest
+    run = 0
+    for a in rest:
+        if a.startswith("-"):
+            break
+        run += 1
+    for k in range(run, 1, -1):                     # longest join first (needs ≥2)
+        joined = " ".join(rest[:k])
+        if Path(joined).expanduser().exists():
+            return [joined] + rest[k:]
+    return rest
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        _print_help()
+        return 0
+
+    cmd = args[0]
+    rest = args[1:]
+
+    # Recover an unquoted filename the shell split on its spaces (e.g.
+    # `distill My Great Paper.pdf` → the handler sees one path arg).
+    rest = _reassemble_spaced_path(rest)
+
+    if cmd not in HANDLERS:
+        # Backward compat: if first arg is a file/dir, treat as "run"
+        if Path(cmd).exists():
+            rest = [cmd] + rest
+            cmd = "drill"
+        else:
+            print(f"Unknown command: {cmd}. Run `pdfdrill help` for usage.", file=sys.stderr)
+            return 1
+
+    # PREFLIGHT HARD STOP: a build/extract command is refused until the LLM has
+    # attested it read the SKILL (`pdfdrill preflight --ack <TOKEN>`), so it can't
+    # silently produce trusted-but-wrong output from a half-read SKILL. Read-only
+    # bootstrap commands stay open. Bypass with PDFDRILL_NO_PREFLIGHT=1.
+    try:
+        from . import preflight
+        if preflight.blocks(cmd):
+            print(preflight.gate_message(cmd), file=sys.stderr)
+            return 2
+    except Exception:
+        pass                                # a broken gate must never brick the CLI
+
+    # --ensure: auto-insert the missing OFFLINE prerequisite steps (model /
+    # bibliography) before running the target — the state machine reacting to a
+    # skipped step. The target's own handler still runs normally afterwards.
+    if "--ensure" in rest:
+        rest = [a for a in rest if a != "--ensure"]
+        try:
+            from . import planner
+            pdf_arg = next((a for a in rest if not a.startswith("-")), None)
+            if pdf_arg is not None:
+                ran = planner.ensure(cmd, Path(pdf_arg), HANDLERS, pdf_arg)
+                if ran:
+                    print(f"[ensure] ran missing prerequisite(s): {', '.join(ran)}")
+        except Exception as e:
+            print(f"[ensure] skipped ({e})", file=sys.stderr)
+
+    try:
+        result = HANDLERS[cmd](rest)
+        if result:
+            print(result)
+        return 0
+    except Exception as e:
+        # Name the exception TYPE (a bare "No such file …" hides that it's a
+        # FileNotFoundError from deep in a handler); PDFDRILL_DEBUG=1 prints the
+        # full traceback so the exact failing file/line is visible.
+        print(f"Error [{type(e).__name__}]: {e}", file=sys.stderr)
+        if os.environ.get("PDFDRILL_DEBUG"):
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+def _pdf(args: list[str]) -> Path:
+    if not args:
+        raise ValueError("No PDF file specified.")
+    arg = args[0]
+    from . import sources
+    # a file:// URI (from a browser / file manager) is a local file — decode it
+    # to a plain path first, so the local-path handling below just works.
+    _file = sources.file_uri_to_path(arg)
+    if _file is not None:
+        arg = _file
+    # expand `~` / `~user` for local paths ($HOME shorthand) — so `~/x.pdf`
+    # resolves exactly like `/home/me/x.pdf`. A no-op on URLs / bare arXiv ids.
+    if not sources.is_url(arg):
+        arg = str(Path(arg).expanduser())
+        # REOPEN by FOLDER: a self-contained doc folder (`<stem>/`) → the PDF
+        # inside it, so `pdfdrill <cmd> <stem>/` works like the full path.
+        folder_pdf = sources.pdf_in_folder(Path(arg))
+        if folder_pdf is None and not Path(arg).exists():
+            # a BARE name (arxiv-shaped OR not, e.g. `Zwiebeln`) → the library doc
+            # folder `<library>/<name>/<name>.pdf`. This is how a non-arXiv doc is
+            # reopened by name (the arxiv-id branch below only fires for id-shapes).
+            try:
+                from . import config as cfg
+                folder_pdf = sources.pdf_in_folder(cfg.library_root() / arg)
+            except Exception:                       # noqa: BLE001
+                folder_pdf = None
+        if folder_pdf is not None:
+            return folder_pdf
+    # work directly on an https URL from a known host, OR a bare arXiv id — but
+    # never shadow a real local file (checked first inside resolve_input).
+    if (sources.is_url(arg) or sources.bare_arxiv_id(arg)) and not Path(arg).exists():
+        # download once (cached) to a local PDF so every command runs on it. For
+        # arXiv the stem is the id, recorded so abstract/latex take the FREE routes.
+        info = sources.resolve_input(arg)
+        p = info["path"]
+        if not (p.exists() and p.stat().st_size > 0):
+            raise FileNotFoundError(f"Download failed: {arg}")
+        if info.get("arxiv_id"):
+            try:
+                from .sidecar import Sidecar
+                sc = Sidecar(p)
+                sc.set_evidence("source_arxiv_id", info["arxiv_id"])
+                sc.set_evidence("source_kind", info.get("source"))
+                sc.save()
+            except Exception:
+                pass
+        return p
+    p = Path(arg)
+    if not p.exists():
+        # a path pasted from a rendered page / chat widget may carry a trailing
+        # NBSP/zero-width char, an NFD-decomposed accent, or percent-encoding —
+        # resolve those battle-proven variants before giving up ("first not
+        # found, then found" on a clean retype).
+        fixed = sources.existing_local_path(arg)
+        if fixed is not None:
+            return fixed
+        raise FileNotFoundError(f"Not found: {p}")
+    return p
+
+
+def _drilled(args: list[str]) -> Path:
+    """Resolve the target for a MODEL-ONLY command (translate/classify). These
+    read only the persisted model, so accept a drilled doc whose source file was
+    removed after drilling (e.g. a consumed .md): if `<arg>.drill` exists, use
+    the literal path; otherwise fall back to the normal `_pdf` resolution
+    (local file / known-host URL / bare arXiv id)."""
+    if not args:
+        raise ValueError("No file specified.")
+    from . import sources
+    a0 = args[0] if sources.is_url(args[0]) else str(Path(args[0]).expanduser())
+    cand = Path(a0)
+    if (cand.parent / (cand.name + ".drill")).exists():
+        return cand
+    return _pdf([a0, *args[1:]])
+
+
+def _do_artifacts(args):
+    """pdfdrill artifacts <pdf|md> [--all] — list the drill-folder files
+    (md/json/html/svg/…) with paths, clickable in the drillui Outputs panel.
+    --all includes the giant model JSON (hidden by default)."""
+    from .commands import cmd_artifacts
+    all_files = "--all" in args
+    rest = [a for a in args if a != "--all"]
+    return cmd_artifacts(_drilled(rest), all_files=all_files)
+
+
+def _do_preflight(args):
+    """pdfdrill preflight [--ack <TOKEN>] — the mandatory first step. No arg:
+    print the critical rules + how to attest. `--ack <TOKEN>`: acknowledge that
+    you read the whole SKILL (the token is its LAST line) → unlocks build/extract
+    commands for this session."""
+    from . import preflight as pf
+    # accept `--ack TOKEN`, `--ack=TOKEN`, or a bare DRILL-… token positional
+    token = None
+    for i, a in enumerate(args):
+        if a == "--ack" and i + 1 < len(args):
+            token = args[i + 1]
+        elif a.startswith("--ack="):
+            token = a.split("=", 1)[1]
+        elif a.startswith("DRILL-"):
+            token = a
+    if token:
+        if pf.attest(token):
+            return ("✓ preflight attested — build/extract commands unlocked for "
+                    "this session (24h). You confirmed you read the SKILL.")
+        return ("✗ preflight NOT attested: wrong token. The token is the LAST "
+                "line of SKILL.md — read the whole file, then run "
+                "`pdfdrill preflight --ack <TOKEN>` with that exact value.\n"
+                f"(expected form: {pf.expected_token()[:6]}…)")
+    lines = [pf.rules_card(), ""]
+    # a quick env sanity line (full check: `pdfdrill doctor`)
+    import importlib.util as _u
+    miss = [m for m in ("pdfminer", "pdfplumber", "pydantic")
+            if _u.find_spec(m) is None]
+    lines.append("env: " + ("all core Python deps present"
+                            if not miss else f"MISSING core deps: {', '.join(miss)} "
+                            f"— run `pdfdrill doctor` / `bash bootstrap.sh`"))
+    lines += [
+        "",
+        "TO PROCEED: read SKILL.md to its LAST line to get the attestation token,",
+        "then run:  pdfdrill preflight --ack <TOKEN>",
+        "Build/extract commands (model, mathpix, latex, tiddlers, …) are BLOCKED",
+        "until you do. Read-only commands (size, pdfinfo, doctor, status) are open.",
+    ]
+    return "\n".join(lines)
+
+
+def _do_config(args):
+    """pdfdrill config [--init|--json|--download-dir [DIR]|--library-root DIR]
+    — show/init/set the config file (downloads land in download_dir; each drilled
+    doc gets a self-contained folder under library_root)."""
+    from .commands import cmd_config
+
+    def _val_after(flag):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                return args[i + 1]
+        return None
+
+    if "--init" in args:
+        return cmd_config("init")
+    if "--json" in args:
+        return cmd_config("json")
+    if "--library-root" in args:
+        v = _val_after("--library-root")
+        return cmd_config("set-library-root", v) if v else cmd_config("library-dir")
+    if "--download-dir" in args:
+        v = _val_after("--download-dir")
+        return cmd_config("set-download-dir", v) if v else cmd_config("download-dir")
+    return cmd_config("show")
+
+
+def _do_make(args):
+    """pdfdrill make <pdf> --goal <capability> — PLAN the ordered commands to
+    establish the goal (clobber-checked), then EXECUTE them, recording proofs and
+    stopping at the first failure. A refused plan runs nothing."""
+    goal = None
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--goal" and i + 1 < len(args):
+            goal = args[i + 1]; i += 2; continue
+        if a.startswith("--goal="):
+            goal = a.split("=", 1)[1]; i += 1; continue
+        rest.append(a); i += 1
+    if not goal and len(rest) >= 2:
+        goal = rest.pop()                       # `make <pdf> <goal>` form
+    if not goal:
+        return "usage: pdfdrill make <pdf> --goal <capability>   (e.g. SEMANTIC_BUILT)"
+    pdf = _pdf(rest[:1])
+    from .sidecar import Sidecar
+    from . import capability_planner as cp
+    sc = Sidecar(pdf)
+    held = frozenset(sc.facts)
+    invalid = frozenset(f for f in held if not sc.capability_valid(f))
+
+    def run(cmd):
+        handler = HANDLERS.get(cmd)
+        if handler is None:
+            return False, f"no handler for '{cmd}'"
+        try:
+            out = handler([str(pdf)])
+            first = (out or "").strip().splitlines()[0] if out else "ok"
+            return True, first
+        except Exception as e:                  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
+
+    result = cp.make(goal, run, held=held, invalid=invalid)
+    if isinstance(result, cp.ClobberRefused):
+        return str(result)
+    plan = result.get("plan", [])
+    if not plan:
+        return f"{goal}: already satisfied — nothing to do."
+    lines = [f"make {goal} → plan: {' → '.join(plan)}", ""]
+    for cmd in plan:
+        if cmd in result["executed"]:
+            lines.append(f"  ✓ {cmd}: {result['results'].get(cmd, 'ok')}")
+        elif cmd == result["failed"]:
+            lines.append(f"  ✗ {cmd}: {result['results'].get(cmd, 'failed')}")
+        else:
+            lines.append(f"  · {cmd}: (skipped — prior step failed)")
+    if result["failed"]:
+        lines.append(f"\nStopped at `{result['failed']}`. Fix and re-run "
+                     f"`pdfdrill make {pdf.name} --goal {goal}`.")
+    else:
+        lines.append(f"\nDone: {goal} established.")
+    return "\n".join(lines)
+
+
+def _do_relocate(args):
+    """pdfdrill relocate <pdf|dir> … [--apply] [--library DIR] — migrate legacy
+    scattered drills into the self-contained library layout. Dry-run by default."""
+    from .commands import cmd_relocate
+
+    apply = "--apply" in args
+    library = None
+    rest = []
+    i = 0
+    args = [a for a in args if a != "--apply"]
+    while i < len(args):
+        if args[i] == "--library" and i + 1 < len(args):
+            library = args[i + 1]
+            i += 2
+            continue
+        rest.append(args[i])
+        i += 1
+    if not rest:
+        from . import config as cfg
+        rest = [str(cfg.library_root())]      # default: scan the library root itself
+    return cmd_relocate(rest, library=library, apply=apply)
+
+
+def _do_doctor(args):
+    """pdfdrill doctor — check system tools / Python deps / API keys."""
+    from .commands import cmd_doctor
+    return cmd_doctor()
+
+
+def _do_size(args):
+    from .commands import cmd_size
+    return cmd_size(_pdf(args))
+
+
+def _do_route(args):
+    from .commands import cmd_route
+    pdf_args = [a for a in args if a != "--run"]
+    return cmd_route(_pdf(pdf_args), run="--run" in args)
+
+
+def _do_ls(args):
+    """pdfdrill ls <dir> [--images] — shallow-scan a folder (pdfinfo → sidecar)."""
+    from .commands import cmd_ls
+    from pathlib import Path
+    rest = [a for a in args if a != "--images"]
+    directory = Path(rest[0]).expanduser() if rest else Path.cwd()
+    return cmd_ls(directory, images="--images" in args)
+
+
+def _do_abstract(args):
+    from .commands import cmd_abstract
+    return cmd_abstract(_pdf(args))
+
+
+def _do_toc(args):
+    from .commands import cmd_toc
+    return cmd_toc(_pdf(args))
+
+
+def _do_fonts(args):
+    from .commands import cmd_fonts
+    return cmd_fonts(_pdf(args))
+
+
+def _do_status(args):
+    from .commands import cmd_status
+    return cmd_status(_pdf(args))
+
+
+def _do_pdfinfo(args):
+    from .commands import cmd_pdfinfo
+    return cmd_pdfinfo(_pdf(args))
+
+
+def _do_bibtex(args):
+    from .commands import cmd_bibtex
+    return cmd_bibtex(_pdf(args))
+
+
+def _do_urls(args):
+    from .commands import cmd_urls
+    return cmd_urls(_pdf(args))
+
+
+def _do_links(args):
+    from .commands import cmd_links
+    return cmd_links(_pdf(args))
+
+
+def _do_dests(args):
+    from .commands import cmd_dests
+    return cmd_dests(_pdf(args))
+
+
+def _do_fonts_layer(args):
+    from .commands import cmd_fonts_layer
+    return cmd_fonts_layer(_pdf(args))
+
+
+def _do_images(args):
+    from .commands import cmd_images
+    return cmd_images(_pdf(args))
+
+
+def _do_tsv(args):
+    from .commands import cmd_tsv
+    pdf_args: list[str] = []
+    force_ocr = False
+    for a in args:
+        if a == "--ocr":
+            force_ocr = True
+        else:
+            pdf_args.append(a)
+    return cmd_tsv(_pdf(pdf_args), force_ocr=force_ocr)
+
+
+def _do_render(args):
+    from .commands import cmd_render
+    pdf_args: list[str] = []
+    force = False
+    for a in args:
+        if a == "--force":
+            force = True
+        else:
+            pdf_args.append(a)
+    return cmd_render(_pdf(pdf_args), force=force)
+
+
+def _do_mathpix(args):
+    """pdfdrill mathpix <pdf> [--force]"""
+    from .commands import cmd_mathpix
+    pdf_args: list[str] = []
+    force = False
+    for a in args:
+        if a == "--force":
+            force = True
+        else:
+            pdf_args.append(a)
+    return cmd_mathpix(_pdf(pdf_args), force=force)
+
+
+def _do_embedimages(args):
+    """pdfdrill embedimages <pdf> [--force]"""
+    from .commands import cmd_embedimages
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_embedimages(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_vision(args):
+    """pdfdrill vision <pdf> [--limit N] [--force]"""
+    from .commands import cmd_vision
+    pdf_args: list[str] = []
+    limit = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_vision(_pdf(pdf_args), limit=limit, force=force)
+
+
+def _do_llm(args):
+    """pdfdrill llm <pdf> [--show | --runtime]"""
+    from .commands import cmd_llm
+    from .llm_delegate import detect_runtime
+    if "--runtime" in args:
+        return f"llm-delegation runtime: {detect_runtime().value}"
+    action = "show" if "--show" in args else "status"
+    pdf_args = [a for a in args if a not in ("--show", "--status")]
+    return cmd_llm(_pdf(pdf_args), action=action)
+
+
+def _do_entities(args):
+    """pdfdrill entities <pdf>"""
+    from .commands import cmd_entities
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_entities(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_segment(args):
+    """pdfdrill segment <pdf> [--force]"""
+    from .commands import cmd_segment
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_segment(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_elements(args):
+    """pdfdrill elements <pdf> [--model M.npz] [--bibkey KEY] [--source S]
+    [--lang deu+eng] [--ppi 300] [--force]"""
+    from .commands import cmd_elements
+    model, args = _opt(args, "--model")
+    bibkey, args = _opt(args, "--bibkey")
+    source, args = _opt(args, "--source")
+    lang, args = _opt(args, "--lang")
+    ppi, args = _opt(args, "--ppi")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_elements(_pdf(pdf_args), force="--force" in args, model=model,
+                        bibkey=bibkey, source=source,
+                        ppi=int(ppi) if ppi else 300, lang=lang or "deu+eng")
+
+
+def _do_semantic(args):
+    """pdfdrill semantic <pdf> [--store graph.json] [--force]"""
+    from .commands import cmd_semantic
+    store, args = _opt(args, "--store")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_semantic(_pdf(pdf_args), store=store, force="--force" in args)
+
+
+def _do_ordered(args):
+    """pdfdrill ordered <pdf> [--threshold 0.5]"""
+    from .commands import cmd_ordered
+    thr, args = _opt(args, "--threshold")
+    return cmd_ordered(_pdf(args), threshold=float(thr) if thr else 0.5)
+
+
+def _do_autosegment(args):
+    """pdfdrill autosegment <pdf> [--threshold 0.5]"""
+    from .commands import cmd_autosegment
+    thr, args = _opt(args, "--threshold")
+    return cmd_autosegment(_pdf(args), threshold=float(thr) if thr else 0.5)
+
+
+def _do_fontid(args):
+    """pdfdrill fontid <pdf> [--pages N|N-M] [--limit 12] [--ppi 200]"""
+    from .commands import cmd_fontid
+    pages, args = _opt(args, "--pages")
+    limit, args = _opt(args, "--limit")
+    ppi, args = _opt(args, "--ppi")
+    return cmd_fontid(_pdf(args), pages=pages, limit=int(limit) if limit else 12,
+                      ppi=int(ppi) if ppi else 200)
+
+
+def _do_spellqc(args):
+    """pdfdrill spellqc <pdf> [--lang de|en]"""
+    from .commands import cmd_spellqc
+    lang, args = _opt(args, "--lang")
+    return cmd_spellqc(_pdf(args), lang=lang)
+
+
+def _do_qr(args):
+    """pdfdrill qr <pdf> [--pages N|N-M] [--dpi 300] [--formats QRCode,DataMatrix]"""
+    from .commands import cmd_qr
+    dpi, args = _opt(args, "--dpi")
+    pages, args = _opt(args, "--pages")
+    formats, args = _opt(args, "--formats")
+    return cmd_qr(_pdf(args), dpi=int(dpi) if dpi else 300, pages=pages, formats=formats)
+
+
+def _do_selftest(args):
+    """pdfdrill selftest <pdf|dir> [--full]"""
+    from .commands import cmd_selftest
+    full = "--full" in args
+    rest = [a for a in args if a != "--full"]
+    from pathlib import Path
+    return cmd_selftest(Path(rest[0]) if rest else Path("."), full=full)
+
+
+def _do_rasterize(args):
+    """pdfdrill rasterize <pdf> [--pages N|N-M|all] [--dpi 400] [--fmt png|jpeg] [--force]"""
+    from .commands import cmd_rasterize
+    pages, args = _opt(args, "--pages")
+    dpi, args = _opt(args, "--dpi")
+    fmt, args = _opt(args, "--fmt")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_rasterize(_pdf(pdf_args), pages=pages, dpi=int(dpi) if dpi else 400,
+                         fmt=fmt or "png", force="--force" in args)
+
+
+def _do_inspect(args):
+    """pdfdrill inspect <pdf> [--pages N|N-M|all] [--dpi 120] [--no-images] [--force]"""
+    from .commands import cmd_inspect
+    pages, args = _opt(args, "--pages")
+    dpi, args = _opt(args, "--dpi")
+    flags = ("--no-images", "--force")
+    pdf_args = [a for a in args if a not in flags]
+    return cmd_inspect(_pdf(pdf_args), pages=pages, dpi=int(dpi) if dpi else 120,
+                       images="--no-images" not in args, force="--force" in args)
+
+
+def _do_attachments(args):
+    """pdfdrill attachments <pdf> [--extract]"""
+    from .commands import cmd_attachments
+    pdf_args = [a for a in args if a != "--extract"]
+    return cmd_attachments(_pdf(pdf_args), extract="--extract" in args)
+
+
+def _do_formfields(args):
+    """pdfdrill formfields <pdf>"""
+    from .commands import cmd_formfields
+    return cmd_formfields(_pdf(args))
+
+
+def _do_extractimages(args):
+    """pdfdrill extractimages <pdf> [--pages N|N-M] [--all-formats] [--force]"""
+    from .commands import cmd_extractimages
+    pages, args = _opt(args, "--pages")
+    pdf_args = [a for a in args if a not in ("--force", "--all-formats")]
+    return cmd_extractimages(_pdf(pdf_args), pages=pages,
+                             original_format="--all-formats" in args,
+                             force="--force" in args)
+
+
+def _do_tables(args):
+    """pdfdrill tables <pdf> [--pages N|N-M]"""
+    from .commands import cmd_tables
+    pages, args = _opt(args, "--pages")
+    return cmd_tables(_pdf(args), pages=pages)
+
+
+def _do_pageside(args):
+    """pdfdrill pageside <pdf>"""
+    from .commands import cmd_pageside
+    return cmd_pageside(_pdf(args))
+
+
+def _do_continuity(args):
+    """pdfdrill continuity <pdf> [--lang deu+eng] [--ppi 250] [--force]"""
+    from .commands import cmd_continuity
+    lang, args = _opt(args, "--lang")
+    ppi, args = _opt(args, "--ppi")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_continuity(_pdf(pdf_args), force="--force" in args,
+                          ppi=int(ppi) if ppi else 250, lang=lang or "deu+eng")
+
+
+def _do_ocr(args):
+    """pdfdrill ocr <pdf> [--lang eng] [--ppi 400] [--min-conf 5] [--no-typing]
+    [--force] — enriched tesseract OCR → typed lines.json in PDF points."""
+    from .commands import cmd_ocr
+    pdf_args: list[str] = []
+    lang = "eng"
+    ppi = 300                      # floored to the module's >=400 DPI gs minimum
+    force = False
+    min_conf = None
+    typing = True
+    i = 0
+    while i < len(args):
+        if args[i] == "--lang" and i + 1 < len(args):
+            lang = args[i + 1]; i += 2
+        elif args[i] == "--ppi" and i + 1 < len(args):
+            ppi = int(args[i + 1]); i += 2
+        elif args[i] == "--min-conf" and i + 1 < len(args):
+            min_conf = float(args[i + 1]); i += 2
+        elif args[i] == "--no-typing":
+            typing = False; i += 1
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_ocr(_pdf(pdf_args), lang=lang, ppi=ppi, force=force,
+                   min_conf=min_conf, typing=typing)
+
+
+def _opt(args, name):
+    """Pop `--name VALUE`; return (value_or_None, remaining_args)."""
+    out, val, i = [], None, 0
+    while i < len(args):
+        if args[i] == name and i + 1 < len(args):
+            val = args[i + 1]; i += 2
+        else:
+            out.append(args[i]); i += 1
+    return val, out
+
+
+def _do_model(args):
+    """pdfdrill model <pdf> [--bibkey KEY] [--force]"""
+    from .commands import cmd_model
+    bibkey, args = _opt(args, "--bibkey")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_model(_pdf(pdf_args), force="--force" in args, bibkey=bibkey)
+
+
+def _do_compare(args):
+    """pdfdrill compare <pdf> [--force] [--embed]"""
+    from .commands import cmd_compare
+    pdf_args = [a for a in args if a not in ("--force", "--embed")]
+    return cmd_compare(_pdf(pdf_args), force="--force" in args, embed="--embed" in args)
+
+
+def _do_snip(args):
+    """pdfdrill snip <pdf> [--limit N] [--force] [--gemma|--provider mathpix|gemma]
+    pdfdrill snip <pdf> --image <path|url>            (OCR any special image)
+    pdfdrill snip <pdf> --page N --rect x0,y0,x1,y1   (deliver+OCR a region crop)
+
+    --gemma routes the OCR through the Gemma-4 vision model (Novita.ai) instead of
+    MathPix — the cheap image→LaTeX table route (needs NOVITA_API_KEY)."""
+    from .commands import cmd_snip
+    image, args = _opt(args, "--image")
+    page, args = _opt(args, "--page")
+    rect_s, args = _opt(args, "--rect")
+    ppi, args = _opt(args, "--ppi")
+    limit, args = _opt(args, "--limit")
+    provider, args = _opt(args, "--provider")
+    if "--gemma" in args:
+        provider = "gemma"
+    rect = tuple(float(x) for x in rect_s.split(",")) if rect_s else None
+    pdf_args = [a for a in args if a not in ("--force", "--gemma")]
+    return cmd_snip(_pdf(pdf_args), limit=int(limit) if limit else None,
+                    force="--force" in args, image=image,
+                    page=int(page) if page else None, rect=rect,
+                    ppi=int(ppi) if ppi else 200,
+                    provider=provider)      # None → vision_router decides
+
+
+def _do_nlp(args):
+    """pdfdrill nlp <pdf> [--limit N] [--pages N] [--types T,T] [--force]"""
+    from .commands import cmd_nlp
+    pdf_args: list[str] = []
+    limit = pages = None
+    types = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] == "--pages" and i + 1 < len(args):
+            pages = int(args[i + 1]); i += 2
+        elif args[i] == "--types" and i + 1 < len(args):
+            types = [t.strip() for t in args[i + 1].split(",") if t.strip()]; i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_nlp(_pdf(pdf_args), limit=limit, pages=pages, types=types, force=force)
+
+
+def _do_geometry(args):
+    """pdfdrill geometry <pdf> [--force]"""
+    from .commands import cmd_geometry
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_geometry(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_translate(args):
+    """pdfdrill translate <pdf> [--to LANG] [--from LANG] [--limit N] [--force]"""
+    from .commands import cmd_translate
+    to, args = _opt(args, "--to")
+    src, args = _opt(args, "--from")
+    limit, args = _opt(args, "--limit")
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_translate(_drilled(pdf_args), target_lang=(to or "EN-US"),
+                         source_lang=src, limit=int(limit) if limit else None,
+                         force="--force" in args)
+
+
+def _do_tiddlers(args):
+    """pdfdrill tiddlers <pdf> [--bibkey KEY] [--force] [--embed] [--embed-svg=false]"""
+    from .commands import cmd_tiddlers
+    bibkey, args = _opt(args, "--bibkey")
+    # diagram SVGs: inline in the svg_tiddler field (default) or external files
+    # referenced by _canonical_uri (--embed-svg=false / --no-embed-svg).
+    embed_svg = not any(a in ("--embed-svg=false", "--no-embed-svg") for a in args)
+    flags = ("--force", "--embed", "--embed-svg=false", "--embed-svg=true", "--no-embed-svg")
+    pdf_args = [a for a in args if a not in flags]
+    return cmd_tiddlers(_pdf(pdf_args), force="--force" in args,
+                        embed="--embed" in args, bibkey=bibkey, embed_svg=embed_svg)
+
+
+def _do_lists(args):
+    """pdfdrill lists <pdf> [--force]"""
+    from .commands import cmd_lists
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_lists(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_algorithms(args):
+    """pdfdrill algorithms <pdf> [--force]"""
+    from .commands import cmd_algorithms
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_algorithms(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_annotate(args):
+    """pdfdrill annotate <pdf> [--force]"""
+    from .commands import cmd_annotate
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_annotate(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_score(args):
+    """pdfdrill score <pdf> [--force]"""
+    from .commands import cmd_score
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_score(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_escalate(args):
+    """pdfdrill escalate <pdf> [--limit N]"""
+    from .commands import cmd_escalate
+    pdf_args: list[str] = []
+    limit = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_escalate(_pdf(pdf_args), limit=limit)
+
+
+def _do_relearn(args):
+    """pdfdrill relearn <pdf>"""
+    from .commands import cmd_relearn
+    return cmd_relearn(_pdf(args))
+
+
+def _do_eqnums(args):
+    """pdfdrill eqnums <pdf> [--force]"""
+    from .commands import cmd_eqnums
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_eqnums(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_bibliography(args):
+    """pdfdrill bibliography <pdf> [--force]"""
+    from .commands import cmd_bibliography
+    pdf_args = [a for a in args if a != "--force"]
+    return cmd_bibliography(_pdf(pdf_args), force="--force" in args)
+
+
+def _do_bibsource(args):
+    """pdfdrill bibsource <pdf> [--bbl f.bbl] [--bib f.bib] [--force]"""
+    from .commands import cmd_bibsource
+    pdf_args: list[str] = []
+    bib = bbl = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--bib" and i + 1 < len(args):
+            bib = args[i + 1]; i += 2
+        elif args[i] == "--bbl" and i + 1 < len(args):
+            bbl = args[i + 1]; i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_bibsource(_pdf(pdf_args), bib_path=bib, bbl_path=bbl, force=force)
+
+
+def _do_report(args):
+    """pdfdrill report <pdf> [--force] [--embed] [--scale 1.0]"""
+    from .commands import cmd_report
+    scale, args = _opt(args, "--scale")
+    pdf_args = [a for a in args if a not in ("--force", "--embed")]
+    return cmd_report(_pdf(pdf_args), force="--force" in args, embed="--embed" in args,
+                      scale=float(scale) if scale else 1.0)
+
+
+def _do_distill(args):
+    """pdfdrill distill <pdf> [--embed] — a distill-structured single-file reading view."""
+    from .commands import cmd_distill
+    pdf_args = [a for a in args if a != "--embed"]
+    return cmd_distill(_drilled(pdf_args[:1]), embed="--embed" in args)
+
+
+def _do_scikgtex(args):
+    """pdfdrill scikgtex <pdf> [--compile]"""
+    from .commands import cmd_scikgtex
+    pdf_args = [a for a in args if a != "--compile"]
+    return cmd_scikgtex(_pdf(pdf_args), compile="--compile" in args)
+
+
+def _do_stex(args):
+    """pdfdrill stex <pdf> [--stex] [--compile]"""
+    from .commands import cmd_stex
+    flavor = "stex" if "--stex" in args else "latex"
+    pdf_args = [a for a in args if a not in ("--stex", "--compile")]
+    return cmd_stex(_pdf(pdf_args), flavor=flavor, compile="--compile" in args)
+
+
+def _do_pyramid(args):
+    """pdfdrill pyramid <pdf> [--dpi 600] [--force] [--offline]"""
+    from .commands import cmd_pyramid
+    dpi, args = _opt(args, "--dpi")
+    force = "--force" in args
+    offline = "--offline" in args
+    pdf_args = [a for a in args if a not in ("--force", "--offline")]
+    return cmd_pyramid(_pdf(pdf_args), dpi=int(dpi) if dpi else 600, force=force,
+                       offline=offline)
+
+
+def _do_imageserve(args):
+    """pdfdrill imageserve <pdf> [--port 8000] [--dpi N] [--background]"""
+    from .commands import cmd_imageserve
+    port, args = _opt(args, "--port")
+    dpi, args = _opt(args, "--dpi")
+    background = "--background" in args
+    pdf_args = [a for a in args if a != "--background"]
+    return cmd_imageserve(_pdf(pdf_args), port=int(port) if port else 8000,
+                          dpi=int(dpi) if dpi else None, background=background)
+
+
+def _do_lean(args):
+    """pdfdrill lean <pdf> [--limit N] [--force] [--emit-only]"""
+    from .commands import cmd_lean
+    limit, args = _opt(args, "--limit")
+    force = "--force" in args
+    emit_only = "--emit-only" in args
+    pdf_args = [a for a in args if a not in ("--force", "--emit-only")]
+    return cmd_lean(_pdf(pdf_args), limit=int(limit) if limit else None,
+                    force=force, emit_only=emit_only)
+
+
+def _do_svg(args):
+    """pdfdrill svg <pdf|tex> [--limit N] [--force]"""
+    from .commands import cmd_svg
+    pos: list[str] = []
+    limit = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pos.append(args[i]); i += 1
+    if not pos:
+        raise ValueError("Usage: pdfdrill svg <pdf|tex> [--limit N] [--force]")
+    # Resolve via _pdf so a URL / bare arXiv id → the cached PDF (same one `model`/
+    # `latex` used), and a local .pdf/.tex passes through. NEVER Path()-wrap a URL
+    # directly — that collapses https:// → https:/ and 'Not found's it.
+    t = _pdf([pos[0]])
+    return cmd_svg(t, limit=limit, force=force)
+
+
+def _do_rulebook(args):
+    """pdfdrill rulebook <pdf|md> [--force]"""
+    from .commands import cmd_rulebook
+    rest = [a for a in args if a != "--force"]
+    return cmd_rulebook(_drilled(rest), force="--force" in args)
+
+
+def _do_locate(args):
+    """pdfdrill locate <pdf>"""
+    from .commands import cmd_locate
+    return cmd_locate(_pdf(args))
+
+
+def _do_clean(args):
+    """pdfdrill clean <pdf|md>"""
+    from .commands import cmd_clean
+    if not args:
+        raise ValueError("No file specified.")
+    return cmd_clean(Path(args[0]))
+
+
+def _do_llmtext(args):
+    """pdfdrill llmtext <pdf|md> [--delimiter %%%%] [--no-split]"""
+    from .commands import cmd_llmtext
+    delim, args = _opt(args, "--delimiter")
+    rest = [a for a in args if a != "--no-split"]
+    return cmd_llmtext(_drilled(rest), delimiter=delim or "%%%%",
+                       split="--no-split" not in args)
+
+
+def _do_visionocr(args):
+    """pdfdrill visionocr <pdf> [--ingest J] [--dpi N] [--pages N|N-M|all] [--force]"""
+    from .commands import cmd_visionocr
+    ingest, args = _opt(args, "--ingest")
+    dpi, args = _opt(args, "--dpi")
+    pages_s, args = _opt(args, "--pages")
+    force = "--force" in args
+    rest = [a for a in args if a != "--force"]
+    if not rest:
+        raise ValueError("No file specified.")
+    pages = None
+    if pages_s and pages_s != "all":
+        pages = []
+        for part in pages_s.split(","):
+            if "-" in part:
+                a, b = part.split("-", 1)
+                pages.extend(range(int(a), int(b) + 1))
+            else:
+                pages.append(int(part))
+    return cmd_visionocr(_pdf(rest), ingest=ingest, dpi=int(dpi) if dpi else 200,
+                         pages=pages, force=force)
+
+
+def _do_mathcheck(args):
+    """pdfdrill mathcheck <pdf|md> [--limit N]  — flag flattened (non-LaTeX) formulas"""
+    from .commands import cmd_mathcheck
+    lim, rest = _opt(args, "--limit")
+    if not rest:
+        raise ValueError("No file specified.")
+    return cmd_mathcheck(_drilled(rest), limit=int(lim) if lim else 8)
+
+
+def _do_quantities(args):
+    """pdfdrill quantities <pdf|md>  — quantitative-layer report (kinds, measurements, verification tally)"""
+    from .commands import cmd_quantities
+    if not args:
+        raise ValueError("No file specified.")
+    return cmd_quantities(_drilled(args))
+
+
+def _do_ask(args):
+    """pdfdrill ask <pdf|md> "<question>" [--precision P] [--json] [--k N]"""
+    from .commands import cmd_ask
+    precision, args = _opt(args, "--precision")
+    kk, args = _opt(args, "--k")
+    json_out = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if len(rest) < 2:
+        raise ValueError('usage: pdfdrill ask <pdf|md> "<question>"')
+    return cmd_ask(_drilled(rest[:-1]), rest[-1],
+                   precision=float(precision) if precision else None,
+                   json_out=json_out, k=int(kk) if kk else 8)
+
+
+def _do_mathir(args):
+    """pdfdrill mathir <pdf|md>  — canonical math (SymPy) into FO/EQ props['math']"""
+    from .commands import cmd_mathir
+    if not args:
+        raise ValueError("No file specified.")
+    return cmd_mathir(_drilled(args))
+
+
+def _do_scan(args):
+    """pdfdrill scan [job] [--simplex] [--from-dir D] [--no-deskew] [--out-dir D]
+       [--device D] [--title T] [--json]  — acquire paper from the scanner ADF"""
+    from .commands import cmd_scan
+    # Strip every `--flag VALUE` FIRST: otherwise `scan --out-dir /tmp` would read
+    # the value `/tmp` as the positional job name (it has no leading dash).
+    out_dir, args = _opt(args, "--out-dir")
+    from_dir, args = _opt(args, "--from-dir")
+    device, args = _opt(args, "--device")
+    title, args = _opt(args, "--title")
+    job = next((a for a in args if not a.startswith("-")), None)
+    return cmd_scan(job, out_dir=out_dir, simplex="--simplex" in args,
+                    from_dir=from_dir, device=device, title=title,
+                    deskew="--no-deskew" not in args, as_json="--json" in args)
+
+
+def _do_docos(args):
+    """pdfdrill docos [<command line>]  — the document-set shell (L0 selector)"""
+    from .commands import cmd_docos
+    return cmd_docos(" ".join(args))
+
+
+def _do_conclusion(args):
+    """pdfdrill conclusion <pdf|md> [--limit N]  — the document's concluding paragraphs"""
+    from .commands import cmd_conclusion
+    lim, rest = _opt(args, "--limit")
+    if not rest:
+        raise ValueError("No file specified.")
+    return cmd_conclusion(_drilled(rest), limit=int(lim) if lim else 8)
+
+
+def _do_enhance(args):
+    """pdfdrill enhance <pdf|md> [--only a,b] [--skip a,b]  — run the pass pipeline"""
+    from .commands import cmd_enhance
+    only, rest = _opt(args, "--only")
+    skip, rest = _opt(rest, "--skip")
+    if not rest:
+        raise ValueError("No file specified.")
+    return cmd_enhance(_drilled(rest), only=only, skip=skip)
+
+
+def _do_classify(args):
+    """pdfdrill classify <pdf|md> [--k N]  — MSC/subject classification via vocabnet"""
+    from .commands import cmd_classify
+    k, rest = _opt(args, "--k")
+    if not rest:
+        raise ValueError("No file specified.")
+    return cmd_classify(_drilled(rest), k=int(k) if k else 8)
+
+
+def _do_identifiers(args):
+    """pdfdrill identifiers <pdf>"""
+    from .commands import cmd_identifiers
+    return cmd_identifiers(_pdf(args))
+
+
+def _do_booktoc(args):
+    """pdfdrill booktoc <pdf>"""
+    from .commands import cmd_booktoc
+    return cmd_booktoc(_pdf(args))
+
+
+def _do_gaps(args):
+    """pdfdrill gaps <pdf|md>"""
+    from .commands import cmd_gaps
+    return cmd_gaps(_drilled(args))
+
+
+def _do_markdown(args):
+    """pdfdrill markdown <file.md> [--bibkey K] [--force]"""
+    from .commands import cmd_markdown
+    bibkey, args = _opt(args, "--bibkey")
+    rest = [a for a in args if a != "--force"]
+    if not rest:
+        raise ValueError("No Markdown file specified.")
+    return cmd_markdown(Path(rest[0]), bibkey=bibkey, force="--force" in args)
+
+
+def _do_latexbook(args):
+    """pdfdrill latexbook <book.tex> [--bibkey K] [--force] [--no-svg]"""
+    from .commands import cmd_latexbook
+    pos: list[str] = []
+    bibkey = None
+    force = False
+    no_svg = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--bibkey" and i + 1 < len(args):
+            bibkey = args[i + 1]; i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        elif args[i] == "--no-svg":
+            no_svg = True; i += 1
+        else:
+            pos.append(args[i]); i += 1
+    if not pos:
+        raise ValueError("Usage: pdfdrill latexbook <book.tex> [--bibkey K] [--force] [--no-svg]")
+    t = Path(pos[0])
+    if not t.exists():
+        raise FileNotFoundError(f"Not found: {t}")
+    return cmd_latexbook(t, bibkey=bibkey, force=force, no_svg=no_svg)
+
+
+def _do_latex(args):
+    """pdfdrill latex <pdf> [--force] [--compile] [--dump-stages]"""
+    from .commands import cmd_latex
+    flags = ("--force", "--compile", "--dump-stages")
+    pdf_args = [a for a in args if a not in flags]
+    return cmd_latex(_pdf(pdf_args), force="--force" in args,
+                     compile="--compile" in args,
+                     dump_stages="--dump-stages" in args)
+
+
+def _do_beamer(args):
+    """pdfdrill beamer <pdf> [--force] [--compile]  — project to a beamer deck"""
+    from .commands import cmd_beamer
+    pdf_args = [a for a in args if a not in ("--force", "--compile")]
+    return cmd_beamer(_pdf(pdf_args), force="--force" in args,
+                      compile="--compile" in args)
+
+
+def _do_injectlatex(args):
+    """pdfdrill injectlatex <pdf> [--tex <path>] [--force]  — pull the author's
+    LaTeX source IN as gold `tex` provenance (the old `latex` behavior)."""
+    from .commands import cmd_injectlatex
+    pdf_args: list[str] = []
+    tex = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--tex" and i + 1 < len(args):
+            tex = args[i + 1]; i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_injectlatex(_pdf(pdf_args), tex=tex, force=force)
+
+
+def _do_folder(args):
+    """pdfdrill folder <dir> [--force]"""
+    from .commands import cmd_folder
+    pos = [a for a in args if a != "--force"]
+    if not pos:
+        raise ValueError("Usage: pdfdrill folder <dir> [--force]")
+    d = Path(pos[0])
+    if not d.is_dir():
+        raise NotADirectoryError(f"Not a folder: {d}")
+    return cmd_folder(d, force="--force" in args)
+
+
+def _do_bibfetch(args):
+    """pdfdrill bibfetch <pdf> [--limit N] [--force]"""
+    from .commands import cmd_bibfetch
+    pdf_args: list[str] = []
+    limit = None
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_bibfetch(_pdf(pdf_args), limit=limit, force=force)
+
+
+def _do_citedrill(args):
+    """pdfdrill citedrill <pdf|md> [--limit N] [--force]  — drill into citations:
+    find download links + fetch the cited PDFs, stamp drill status on each Reference."""
+    from .commands import cmd_citedrill
+    limit, rest = _opt(args, "--limit")
+    rest = [a for a in rest if a != "--force"]
+    return cmd_citedrill(_drilled(rest), limit=int(limit) if limit else None,
+                         force="--force" in args)
+
+
+def _do_candidates(args):
+    """pdfdrill candidates <pdf> [--provider P] [--limit N] [--out F]"""
+    from .commands import cmd_candidates
+    pdf_args: list[str] = []
+    provider = "llm"
+    limit = None
+    out = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--provider" and i + 1 < len(args):
+            provider = args[i + 1]; i += 2
+        elif args[i] == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1]); i += 2
+        elif args[i] == "--out" and i + 1 < len(args):
+            out = args[i + 1]; i += 2
+        else:
+            pdf_args.append(args[i]); i += 1
+    return cmd_candidates(_pdf(pdf_args), provider=provider, limit=limit, out=out)
+
+
+def _do_ingest(args):
+    """pdfdrill ingest <pdf> <candidates.json> [--provider P] [--force]"""
+    from .commands import cmd_ingest
+    pos: list[str] = []
+    provider = "llm"
+    force = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--provider" and i + 1 < len(args):
+            provider = args[i + 1]; i += 2
+        elif args[i] == "--force":
+            force = True; i += 1
+        else:
+            pos.append(args[i]); i += 1
+    if len(pos) < 2:
+        raise ValueError("Usage: pdfdrill ingest <pdf> <candidates.json> [--provider P] [--force]")
+    return cmd_ingest(_pdf(pos[:1]), pos[1], provider=provider, force=force)
+
+
+def _do_md(args):
+    from .commands import cmd_md
+    pages = None
+    pdf_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--pages" and i + 1 < len(args):
+            pages = args[i + 1]
+            i += 2
+        else:
+            pdf_args.append(args[i])
+            i += 1
+    return cmd_md(_pdf(pdf_args), pages)
+
+
+def _do_page(args):
+    from .commands import cmd_page
+    if len(args) < 2:
+        raise ValueError("Usage: pdfdrill page <pdf> <page_number>")
+    return cmd_page(Path(args[0]), int(args[1]))
+
+
+def _do_fetch(args):
+    from .commands import cmd_fetch
+    if len(args) < 2:
+        raise ValueError("Usage: pdfdrill fetch <pdf> <layer> [--section N]")
+    pdf = Path(args[0])
+    what = args[1]
+    kwargs = {}
+    i = 2
+    while i < len(args):
+        if args[i] == "--section" and i + 1 < len(args):
+            kwargs["section"] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    return cmd_fetch(pdf, what, **kwargs)
+
+
+def _do_plan(args):
+    """Show what pdfdrill would do to answer a question — or, with `--goal
+    <capability>`, the CAPABILITY-planner path: the ordered commands to establish
+    that goal, clobber-checked against what the doc already holds (refuses a plan
+    that would rebuild the model and silently destroy a held enrichment)."""
+    # Capability-goal mode (Phase C): `pdfdrill plan <pdf> --goal SEMANTIC_BUILT`.
+    goal = None
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--goal" and i + 1 < len(args):
+            goal = args[i + 1]; i += 2; continue
+        if a.startswith("--goal="):
+            goal = a.split("=", 1)[1]; i += 1; continue
+        rest.append(a); i += 1
+    if goal:
+        pdf = _pdf(rest[:1])
+        from .sidecar import Sidecar
+        from . import capability_planner as cp
+        sc = Sidecar(pdf)
+        held = frozenset(sc.facts)
+        invalid = frozenset(f for f in held if not sc.capability_valid(f))
+        return cp.describe(goal, held=held, invalid=invalid)
+
+    pdf = _pdf(args[:1])
+    question = " ".join(args[1:]) if len(args) > 1 else ""
+
+    from .sidecar import Sidecar
+    sc = Sidecar(pdf)
+    facts = sc.facts
+
+    steps = []
+    if "SIZE_KNOWN" not in facts:
+        steps.append(("size", "pdfinfo — page count, file size, producer"))
+    if "FONTS_KNOWN" not in facts:
+        steps.append(("fonts", "pdffonts — font list, math font detection"))
+    if "ABSTRACT_KNOWN" not in facts and "ABSTRACT_ABSENT" not in facts:
+        steps.append(("abstract", "pdftotext first 2 pages — extract abstract"))
+    if "TOC_KNOWN" not in facts and "TOC_ABSENT" not in facts:
+        steps.append(("toc", "pdftotext first 3 pages — extract table of contents"))
+
+    needs_md = True  # default: full extraction
+    if question:
+        q_lower = question.lower()
+        if any(w in q_lower for w in ["abstract", "summary", "about", "topic"]):
+            needs_md = False
+            steps.append(("→ answer from abstract", ""))
+        elif any(w in q_lower for w in ["how many pages", "size", "author"]):
+            needs_md = False
+            steps.append(("→ answer from metadata", ""))
+
+    if needs_md and "MD_BUILT" not in facts:
+        steps.append(("md", "pdfplumber + layer pipeline — full Markdown extraction"))
+
+    lines = [f"Plan for {pdf.name}:"]
+    if question:
+        lines.append(f"  Question: \"{question}\"")
+    lines.append(f"  Already known: {', '.join(facts) if facts else 'nothing'}")
+    lines.append(f"  Steps needed:")
+    for name, desc in steps:
+        if desc:
+            lines.append(f"    {name}: {desc}")
+        else:
+            lines.append(f"    {name}")
+
+    return "\n".join(lines)
+
+
+def _do_drill(args):
+    """Auto-drill, status-driven by default.
+
+    Runs only the steps whose fact is not yet present in the sidecar.
+    Use --full to wipe the sidecar first and re-run from cold (useful for
+    testing / forcing a fresh extraction).
+    """
+    pdf_args: list[str] = []
+    full = False
+    for a in args:
+        if a == "--full":
+            full = True
+        elif not a.startswith("--"):
+            pdf_args.append(a)
+    pdf = _pdf(pdf_args[:1])
+
+    from .commands import (
+        cmd_size, cmd_fonts, cmd_abstract, cmd_toc, cmd_md, cmd_status,
+        SIZE_KNOWN, FONTS_KNOWN, ABSTRACT_KNOWN, ABSTRACT_ABSENT,
+        TOC_KNOWN, TOC_ABSENT, MD_BUILT,
+    )
+    from .sidecar import Sidecar
+
+    if full:
+        sc = Sidecar(pdf)
+        if sc.json_path.exists():
+            sc.json_path.unlink()
+        if sc.blob_dir.exists():
+            import shutil
+            shutil.rmtree(sc.blob_dir)
+
+    sc = Sidecar(pdf)
+    facts = sc.facts
+
+    # Status-driven plan: each step contributes a line only if it actually ran.
+    plan: list[tuple[str, callable, set[str]]] = [
+        ("size", lambda: cmd_size(pdf), {SIZE_KNOWN}),
+        ("fonts", lambda: cmd_fonts(pdf), {FONTS_KNOWN}),
+        ("abstract", lambda: cmd_abstract(pdf), {ABSTRACT_KNOWN, ABSTRACT_ABSENT}),
+        ("toc", lambda: cmd_toc(pdf), {TOC_KNOWN, TOC_ABSENT}),
+        ("md", lambda: cmd_md(pdf), {MD_BUILT}),
+    ]
+
+    ran: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for name, fn, settled in plan:
+        if settled & facts:
+            skipped.append(name)
+            continue
+        ran.append((name, fn()))
+        facts = Sidecar(pdf).facts  # refresh in case the step touched others
+
+    lines: list[str] = []
+    if ran:
+        lines.append("Drilled: " + ", ".join(n for n, _ in ran))
+        for n, out in ran:
+            lines.append(f"\n--- {n} ---\n{out}")
+    if skipped:
+        lines.append(f"\nSkipped (already done): {', '.join(skipped)}")
+    if not ran and not skipped:
+        lines.append("Nothing to do.")
+    lines.append("")
+    lines.append(cmd_status(pdf))
+    return "\n".join(lines)
+
+
+def _print_help():
+    # Primary: the help body GENERATED from the canonical commands.yaml manifest
+    # (`tools/skillsync.py render-help`), so --help can never drift from the
+    # command surface again. Falls back to the hand-written text below when the
+    # generated file isn't present (e.g. a partial checkout).
+    _gen = Path(__file__).with_name("_help_generated.txt")
+    if _gen.exists():
+        print(_gen.read_text().rstrip())
+        return
+    print("""pdfdrill — portable PDF drill-down toolkit
+
+Input: <pdf> may be a local path OR an https URL from a known host. arXiv URLs/ids
+(https://arxiv.org/abs/<id>, /pdf/<id>, or a bare 2510.11170v2) download the PDF
+once (cached) and unlock the FREE routes — `abstract` reads the abs page and
+`latex` downloads the e-print .tgz (gold equations), so MathPix is skipped by
+default (use `mathpix --force` to override).
+
+Introspection (fast, no extraction):
+  pdfdrill size <pdf>          File size, page count, producer
+  pdfdrill pdfinfo <pdf>       Full PdfInfo struct (title/author/dates/flags)
+  pdfdrill bibtex <pdf>        Derived BibTeX record
+  pdfdrill links <pdf>         FAST external URLs via pdfinfo -url (~50ms); flags code/data hosts
+  pdfdrill urls <pdf>          URL annotations with anchor text (heavier; pdfplumber)
+  pdfdrill dests <pdf>         Named destinations: theorems, equations, sections
+  pdfdrill fonts_layer <pdf>   Structured per-font records (pdffonts)
+  pdfdrill images <pdf>        Image rectangles + metadata (pdfplumber + pdfimages -list)
+  pdfdrill tsv <pdf>           Word-level bounding boxes (pdftotext -tsv; --ocr forces tesseract)
+  pdfdrill render <pdf>        Render the built markdown to PDF (pandoc + lualatex)
+  pdfdrill rasterize <pdf>     Rasterize page(s) to PNG/JPEG for visual inspection (Ghostscript, the only rasterizer) → sidecar; --pages N|N-M|all --dpi. Read the images to see charts/equations/layout
+  pdfdrill attachments <pdf>   List embedded file attachments (pdfdetach + pypdf); --extract saves them to the sidecar. Surfaces embedded spreadsheets/data invisible to text/MathPix
+  pdfdrill formfields <pdf>    Read interactive AcroForm field values (pypdf get_fields): name/value/type/options. For government/Formulare PDFs
+  pdfdrill extractimages <pdf> Extract embedded raster image BYTES to files (pdfimages -png); --pages N-M --all-formats. Vector charts excluded (use rasterize)
+  pdfdrill tables <pdf>        Extract tables KEYLESS offline (pdfplumber extract_tables) → tables.json + tables.md; --pages N-M
+  pdfdrill mathpix <pdf>       Download MathPix OCR (lines.json, md, tex.zip); --force re-uploads
+  pdfdrill ocr <pdf>           MathPix-free OCR: tesseract → MathPix-compatible lines.json (--lang eng+equ, --ppi N). Plain text only (no LaTeX/CDN)
+  pdfdrill continuity <pdf>    Full-page OCR of the MARGINS → page-sequence markers (Seite N von M / Fortsetzung) MathPix's content crop drops; attaches seq to Page objects
+  pdfdrill pageside <pdf>     Classify each page recto/verso (book left/right) from page-number parity+position + side-note column asymmetry + sequence alternation; attaches page_side to model Pages (column roles flip with the side)
+  pdfdrill entities <pdf>      Commercial entities per page: IBAN (mod-97 validated + BLZ/Konto/bank), BIC, German address, Steuer-/Kassen-/Aktenzeichen. Zero external tools
+  pdfdrill segment <pdf>       Partition a scanned bundle into ordered documents (by sender/identifier + continuity number); flags duplicate copies
+  pdfdrill elements <pdf>      Find layout elements (postal address / BOM line) via the geometric-attention GNN over tesseract word boxes → content-addressed tiddlers (--model M.npz)
+  pdfdrill semantic <pdf>      Build the semantic graph (CSP): extractors become sensors emitting evidence; entities (Company/Person/BankAccount) accumulate it. --store graph.json accumulates ACROSS documents
+  pdfdrill fontid <pdf>        VISUAL font id for scanned/OCR input (no font layer): WORD crops → torch-free ONNX font-classify → vote WITHIN each OCR block, so font is reported per text FIELD (heading/body/fine-print), not one doc vote. Per-field confidence; weak on scanned generic sans. --limit 12 --ppi 200
+  pdfdrill spellqc <pdf>       Dictionary-assisted de-hyphenation QC (hunspell via spylls→enchant→.dic-set, on-demand per language): join/keep/REVIEW each line-break hyphen. Surfaces OCR fragments to fix
+  pdfdrill stex <pdf>          Project the semantic graph to enriched LaTeX: acronyms/glossary/Table-of-Symbols/index (--compile runs lualatex), or sTeX smodule/symdecl/symref (--stex). Needs `semantic` first
+  pdfdrill scikgtex <pdf>      Project to SciKGTeX-annotated LaTeX → compiled PDF carries ORKG contribution metadata (title/authors/field + research-problem/method/result roles + numeric facts + bib-DOI links) as XMP/RDF. --compile (lualatex + vendored scikgtex)
+  pdfdrill qr <pdf>            Scan QR codes & barcodes (zxing-cpp): GiroCode/EPC payment QR (creditor/IBAN/amount/reference) + Data Matrix franking marks — confirmation data outside the text layer. --dpi 300 --formats QRCode,DataMatrix
+  pdfdrill ordered <pdf>       Segment an ORDERED scan stack into documents (gap scoring + DataMatrix tracking codes → 2-level mailing/letter-enclosure). Commercial provenance (publisher=sender, receiver). --threshold 0.5. (Shuffled bundle → use `segment`)
+  pdfdrill autosegment <pdf>   AUTO-PICK ordered vs shuffled: contiguous per-sender runs → `ordered` (gap scorer); interleaved → `segment` (signature grouping). Then runs the right one
+  pdfdrill selftest <pdf|dir>  DIAGNOSTIC GRID: run the command battery across a PDF (or every PDF in a folder), log OK/⊘-n/a/✗-ERROR + the actual result per command → selftest.log. --full adds entities/elements/semantic
+  pdfdrill model <pdf>         Build unified docmodel from lines.json (auto-chains mathpix, falls back to tesseract ocr if no MathPix); --bibkey KEY sets the tiddler prefix (persisted)
+  pdfdrill compare <pdf>       LaTeX | KaTeX | MathPix-image comparison HTML (auto-chains model)
+  pdfdrill report <pdf>        Full inline+display math report (formula-report.html). --scale N scales each KaTeX render to the CDN image height (1.0=same, 2.0=200%); --embed
+  pdfdrill latex <pdf>         Ingest author .tex/.tgz as a `tex` provenance (original+expanded LaTeX); --tex <path>
+  pdfdrill latexbook <book.tex> Source-only model + TikZ/table SVGs + KaTeX formula report from LaTeX (no PDF/MathPix); --no-svg to skip rendering
+  pdfdrill markdown <md>      Build a source-only model from LLM-summary Markdown (yt2tw route): sections/paragraphs/math/lists + cite{} commands linked to the gold ```bibtex appendix (or the numbered References list). --bibkey K
+  pdfdrill identifiers <pdf>  Front-matter scan (scoped by the booktoc offset): checksum-valid ISBN/ISSN/DOI/arXiv + German ids + ALL-CAPS named-entity candidates (publisher/author)
+  pdfdrill booktoc <pdf>      Greppable TOC with printed→PDF page alignment (front-matter offset from title↔section matches): grep a chapter/section name → its PDF page
+  pdfdrill gaps <pdf|md>      Report MISSING information (cohomology-as-linter): acronyms used but never expanded, undeclared math symbols, novelty claims without citations, unmatched in-text citations
+  pdfdrill llmtext <pdf|md>   Flat LLM dump: per unit the tiddler title + paragraph text / formula latex, document order, units split on double line breaks + separated by --delimiter (default %%%%); empty formulas skipped
+  pdfdrill clean <pdf|md>     Strip MathPix LaTeX residuals from the model: a leading section* command merged into a paragraph -> the title alone + kind/refnum fields (so semantic analysis sees plain text)
+  pdfdrill locate <pdf>       Locate embedded images on their pages (canonical pt/top-left coords + normalized [0,1] + PDF object number), detect full-page/template images, and COMPARE to MathPix regions (IoU) incl. MathPix-only figures
+  pdfdrill rulebook <pdf|md>  Claims/definitions -> kitems (fixpoint, evidence spans) -> rulebook.md: one supported/accepted statement per line with a [->k:hash] drill-down anchor + kitem tiddlers
+  pdfdrill svg <pdf|tex>       Render TikZ diagrams + tables to SVG via latex->dvisvgm (KaTeX can't); embeds in the report
+  pdfdrill folder <dir>        Build the full structure for every PDF in <dir> from existing
+                               .lines.json/.bib/.md — runs all levels, NO MathPix/Perplexity calls
+  pdfdrill snip <pdf>          OCR each equation crop via MathPix Snip (/v3/text) → competing column; --limit N
+  pdfdrill snip <pdf> --image <path|url>            Deliver+OCR ANY special image (not just equations)
+  pdfdrill snip <pdf> --page N --rect x0,y0,x1,y1   Rasterize+deliver a region crop (PNG to Read) + OCR it; the crop is delivered even if OCR is unavailable
+  pdfdrill candidates <pdf>    Export equation crops as a manifest for an LLM to read; --provider P --limit N
+  pdfdrill ingest <pdf> <json> Attach externally-produced {eq_id,latex} candidates as a provenance column; --provider P
+  pdfdrill vision <pdf>        GPT-4o vision reads every MathPix CDN crop (incl. table-cell images) → math/TikZ/gnuplot/table as the `openai` provenance; --limit N (needs OPENAI_API_KEY)
+  pdfdrill embedimages <pdf>   Lift pdfimages + pdfplumber image rects into the model as EmbeddedImage nodes (pixel size/encoding/ppi + page rect), fused onto MathPix crops they contain
+  pdfdrill geometry <pdf>      Fuse pdftotext -tsv layout (indent/margins) onto the model — substrate for block detection
+  pdfdrill tiddlers <pdf>      Emit a TiddlyWiki JSON tiddler array (latex/displayMode/canonical_uri/width/height) for quick inspection; --bibkey KEY sets the title prefix + filename. Diagram SVGs inline by default; --embed-svg=false writes them to .drill/svg/<title>.svg and references via _canonical_uri (leaner store)
+  pdfdrill translate <pdf>     DeepL-translate the document IN PLACE (--to EN-US --from RU): writes the changed tiddler file (translated text field) AND a bi-layer Markdown <bibkey>.md (translation + hidden source, CSS toggle); original kept under <field>_source (needs DEEPL_API_KEY)
+  pdfdrill lists <pdf>         Nest flat ListItems into recursive List blocks using fused indentation (auto-chains geometry)
+  pdfdrill algorithms <pdf>    Reconstruct Algorithm blocks from MathPix pseudocode lines (caption + indented steps)
+  pdfdrill annotate <pdf>      Promote hyperlink annotations into the model as first-class Link nodes (uri + rect Region)
+  pdfdrill score <pdf>         Score equations by cross-provenance agreement + snip confidence; flags review candidates
+  pdfdrill nlp <pdf>           Stanza NLP over prose (POS/lemma/dependency + NER → props['nlp']); --limit N --pages N --types T,T  (optional [nlp] extra)
+  pdfdrill escalate <pdf>      Phase-3: export flagged equations for a second LLM reading; --limit N
+  pdfdrill relearn <pdf>       Phase-3: re-score after ingest; report resolved vs still-flagged
+  pdfdrill eqnums <pdf>        Fuse equation numbers ("(N)") from margin geometry for ||FO/||FREF transclusion
+  pdfdrill bibliography <pdf>  Parse the References section into Reference nodes (citekey/author/year/text)
+  pdfdrill bibsource <pdf>     Ingest the author's GOLD bibliography (--bbl file.bbl + --bib file.bib): alpha label↔citekey↔fields, links in-text citations by label. No API.
+  pdfdrill bibfetch <pdf>      Enrich References with full BibTeX via Perplexity SONAR; --limit N (needs PERPLEXITY_API_KEY)
+  pdfdrill toc <pdf>           Table of contents
+  pdfdrill abstract <pdf>      Abstract from first pages
+  pdfdrill fonts <pdf>         Font analysis, math font detection
+  pdfdrill status <pdf>        What is already known
+  pdfdrill doctor              Requirement check: system tools (poppler/tesseract/LaTeX+dvisvgm), Python deps, API keys + the apt-get fix line
+
+Extraction:
+  pdfdrill md <pdf>            Full Markdown with math transclusions
+  pdfdrill page <pdf> <n>      Single page text extraction
+
+Query:
+  pdfdrill fetch <pdf> md      Retrieve stored Markdown
+  pdfdrill fetch <pdf> md --section 3   Specific section
+  pdfdrill fetch <pdf> abstract
+
+Planning & automation:
+  pdfdrill plan <pdf> "question"   Show what steps are needed
+  pdfdrill drill <pdf>             Full auto-drill
+
+State persists in <pdf>.drill.json next to the PDF file.
+Each command returns prose ready for LLM consumption.""")
+
+
+def _do_skill(args):
+    """pdfdrill skill --emit DIR | --json | --check  (read-only; bundled SKILL folder)"""
+    from .skill_cmd import run
+    return run(args)
+
+
+def _do_steps(args):
+    """pdfdrill steps <cmd> <pdf|md> — show the prerequisite chain for a command
+    (what's already done, what `--ensure` would auto-run first)."""
+    from . import planner
+    if len(args) < 2:
+        raise ValueError("usage: pdfdrill steps <cmd> <pdf>")
+    return planner.describe(args[0], _drilled(args[1:]))
+
+
+def _do_remath(args):
+    """pdfdrill remath <pdf> [--pages N|N-M|all] [--force] — rebuild MathPix-quality
+    Markdown (LaTeX math) from rendered pages via Claude delegation (keyless)."""
+    from .commands import cmd_remath
+    pages_s, rest = _opt(args, "--pages")
+    rest = [a for a in rest if a != "--force"]
+    pages = None
+    if pages_s and pages_s.lower() != "all":
+        if "-" in pages_s:
+            a, b = pages_s.split("-", 1); pages = list(range(int(a), int(b) + 1))
+        else:
+            pages = [int(pages_s)]
+    return cmd_remath(_pdf(rest), pages=pages, force="--force" in args)
+
+
+def _do_retrieve(args):
+    """pdfdrill retrieve <pdf|md> "<question>" [--k N] [--json] — top-k relevant
+    units as grounded context (the chat-proxy question transformation)."""
+    from .commands import cmd_retrieve
+    k, rest = _opt(args, "--k")
+    as_json = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
+    if len(rest) < 2:
+        raise ValueError('usage: pdfdrill retrieve <pdf> "<question>" [--k N] [--json]')
+    return cmd_retrieve(_drilled(rest[:1]), rest[1], k=int(k) if k else 8,
+                        as_json=as_json)
+
+
+def _do_reconcile(args):
+    """pdfdrill reconcile <pdf> [--mathpix LINES.json] [--adopt-all] — dual-route:
+    keep pdfminer structure+geometry, correct math with MathPix (region-matched)."""
+    from .commands import cmd_reconcile
+    mathpix, args = _opt(args, "--mathpix")
+    adopt_all = "--adopt-all" in args
+    args = [a for a in args if a != "--adopt-all"]
+    return cmd_reconcile(_pdf(args), mathpix=mathpix, adopt_all=adopt_all)
+
+
+def _do_occurrences(args):
+    """pdfdrill occurrences <pdf> [--type Equation,Table,…] — per-element region
+    list (page+bbox+title) for external image-enrichment tools."""
+    from .commands import cmd_occurrences
+    types, args = _opt(args, "--type")
+    return cmd_occurrences(_drilled(args[:1]), types=types)
+
+
+def _do_okf(args):
+    """pdfdrill okf <pdf> [--out DIR] [--bibkey K] — project the docmodel into an
+    OKF (Open Knowledge Format) bundle (Markdown-with-frontmatter, one file/unit)."""
+    from .commands import cmd_okf
+    out, args = _opt(args, "--out")
+    bibkey, args = _opt(args, "--bibkey")
+    semantic = "--semantic" in args
+    args = [a for a in args if a != "--semantic"]
+    return cmd_okf(_drilled(args[:1]), out=out, bibkey=bibkey, semantic=semantic)
+
+
+def _do_fontspans(args):
+    """pdfdrill fontspans <pdf> [--pages P] — the pdfminer leg: recover the local
+    formatting MathPix flattens (bold headings, bold/italic key terms, small
+    footnotes) from the born-digital glyph layer; writes <bibkey>.fontspans.json
+    and attaches per-page emphasis onto Page objects."""
+    from .commands import cmd_fontspans
+    pages, args = _opt(args, "--pages")
+    return cmd_fontspans(_pdf(args), pages=pages)
+
+
+def _do_repoinit(args):
+    """pdfdrill repoinit <dir> [--username U] [--title T] — scaffold a GitHub-repo
+    TiddlyWiki document-set layout (tiddlywiki.info, package.json, .gitignore,
+    .nojekyll, pdfdrill-repo.json, tiddlers/, files/)."""
+    from .repo_publish import cmd_repoinit
+    username, args = _opt(args, "--username")
+    title, args = _opt(args, "--title")
+    return cmd_repoinit(args[0], username=username, title=title)
+
+
+def _do_publish(args):
+    """pdfdrill publish <dir> <pdf>… [--username U] [--title T] — export each
+    drilled doc's tiddlers into <dir>/tiddlers/<bibkey>/, copy PDFs into
+    <dir>/files/, refresh the Documents landing + pdfdrill-repo.json. Auto-scaffolds."""
+    from .repo_publish import cmd_publish
+    username, args = _opt(args, "--username")
+    title, args = _opt(args, "--title")
+    return cmd_publish(args[0], args[1:], username=username, title=title)
+
+
+def _do_merge(args):
+    """pdfdrill merge <pdf> [--tex PATH] — merge gold LaTeX prose onto the MathPix
+    layout: MathPix fixes paragraph boundaries+regions, LaTeX supplies the text
+    (LaTeX always wins; OCR kept as text_source)."""
+    from .commands import cmd_merge
+    tex, args = _opt(args, "--tex")
+    return cmd_merge(_pdf(args), tex=tex)
+
+
+def _do_context(args):
+    """pdfdrill context <pdf> ["query"] [--type T,T] [--concept X] [--section S]
+    [--k N] [--max-tokens N] [--aspect A] [--out FILE] — project the docmodel into
+    an LLM context (structural RAG)."""
+    from .commands import cmd_context
+    types, args = _opt(args, "--type")
+    concept, args = _opt(args, "--concept")
+    section, args = _opt(args, "--section")
+    k, args = _opt(args, "--k")
+    max_tokens, args = _opt(args, "--max-tokens")
+    aspect, args = _opt(args, "--aspect")
+    out, args = _opt(args, "--out")
+    if not args:
+        raise ValueError('usage: pdfdrill context <pdf> ["query"] [--type …] '
+                         '[--concept …] [--section …] [--max-tokens N] [--out F]')
+    query = args[1] if len(args) > 1 else ""
+    return cmd_context(_drilled(args[:1]), query, types=types, concept=concept,
+                       section=section, k=int(k) if k else None,
+                       max_tokens=int(max_tokens) if max_tokens else None,
+                       aspect=aspect or "structural", out=out)
+
+
+def _do_combine(args):
+    """pdfdrill combine <doc> <doc> [...] --out FILE [--force] — merge several
+    drilled docs into one combined store for multi-document chat/retrieve."""
+    from .commands import cmd_combine
+    out, rest = _opt(args, "--out")
+    force = "--force" in rest
+    rest = [a for a in rest if a != "--force"]
+    if not out:
+        raise ValueError('usage: pdfdrill combine <doc> <doc> … --out FILE [--force]')
+    if not rest:
+        raise ValueError("combine needs at least one input document.")
+    pdfs = [_drilled([a]) for a in rest]
+    return cmd_combine(Path(out), pdfs, force=force)
+
+
+def _do_chatlog(args):
+    """pdfdrill chatlog <pdf|md> --question Q --answer A [--units id,id] [--model M]
+    [--verdict correct|wrong] — store one Q&A turn (transcript + answer kitem in
+    the semantic graph); --verdict feeds the ask-precision calibration tally."""
+    from .commands import cmd_chatlog
+    q, rest = _opt(args, "--question")
+    a, rest = _opt(rest, "--answer")
+    units, rest = _opt(rest, "--units")
+    model, rest = _opt(rest, "--model")
+    verdict, rest = _opt(rest, "--verdict")
+    if not rest or q is None or a is None:
+        raise ValueError('usage: pdfdrill chatlog <pdf> --question Q --answer A '
+                         '[--units id,id] [--model M] [--verdict correct|wrong]')
+    return cmd_chatlog(_drilled(rest), q, a, units=units or "", model=model or "",
+                       verdict=verdict)
+
+
+# Module-level command table — the single dispatch surface, also read by
+# `pdfdrill skill --check` and the skill-sync drift gate (manifest <-> HANDLERS).
+HANDLERS = {
+        "doctor": _do_doctor,
+        "config": _do_config,
+        "preflight": _do_preflight,
+        "make": _do_make,
+        "relocate": _do_relocate,
+        "artifacts": _do_artifacts,
+        "size": _do_size,
+        "route": _do_route,
+        "ls": _do_ls,
+        "abstract": _do_abstract,
+        "toc": _do_toc,
+        "fonts": _do_fonts,
+        "status": _do_status,
+        "md": _do_md,
+        "page": _do_page,
+        "fetch": _do_fetch,
+        "plan": _do_plan,
+        "drill": _do_drill,
+        "pdfinfo": _do_pdfinfo,
+        "bibtex": _do_bibtex,
+        "urls": _do_urls,
+        "links": _do_links,
+        "dests": _do_dests,
+        "fonts_layer": _do_fonts_layer,
+        "images": _do_images,
+        "tsv": _do_tsv,
+        "render": _do_render,
+        "mathpix": _do_mathpix,
+        "ocr": _do_ocr,
+        "continuity": _do_continuity,
+        "pageside": _do_pageside,
+        "entities": _do_entities,
+        "segment": _do_segment,
+        "elements": _do_elements,
+        "semantic": _do_semantic,
+        "qr": _do_qr,
+        "fontid": _do_fontid,
+        "spellqc": _do_spellqc,
+        "ordered": _do_ordered,
+        "autosegment": _do_autosegment,
+        "selftest": _do_selftest,
+        "rasterize": _do_rasterize,
+        "attachments": _do_attachments,
+        "formfields": _do_formfields,
+        "extractimages": _do_extractimages,
+        "tables": _do_tables,
+        "model": _do_model,
+        "compare": _do_compare,
+        "snip": _do_snip,
+        "candidates": _do_candidates,
+        "ingest": _do_ingest,
+        "vision": _do_vision,
+        "llm": _do_llm,
+        "embedimages": _do_embedimages,
+        "geometry": _do_geometry,
+        "tiddlers": _do_tiddlers,
+        "translate": _do_translate,
+        "lists": _do_lists,
+        "algorithms": _do_algorithms,
+        "annotate": _do_annotate,
+        "score": _do_score,
+        "nlp": _do_nlp,
+        "escalate": _do_escalate,
+        "relearn": _do_relearn,
+        "eqnums": _do_eqnums,
+        "bibliography": _do_bibliography,
+        "bibsource": _do_bibsource,
+        "bibfetch": _do_bibfetch,
+        "citedrill": _do_citedrill,
+        "report": _do_report,
+        "distill": _do_distill,
+        "inspect": _do_inspect,
+        "folder": _do_folder,
+        "latex": _do_latex,
+        "beamer": _do_beamer,
+        "injectlatex": _do_injectlatex,
+        "latexbook": _do_latexbook,
+        "markdown": _do_markdown,
+        "identifiers": _do_identifiers,
+        "booktoc": _do_booktoc,
+        "gaps": _do_gaps,
+        "llmtext": _do_llmtext,
+        "mathcheck": _do_mathcheck,
+        "quantities": _do_quantities,
+        "ask": _do_ask,
+        "mathir": _do_mathir,
+        "enhance": _do_enhance,
+        "conclusion": _do_conclusion,
+        "docos": _do_docos,
+        "scan": _do_scan,
+        "visionocr": _do_visionocr,
+        "classify": _do_classify,
+        "clean": _do_clean,
+        "locate": _do_locate,
+        "rulebook": _do_rulebook,
+        "svg": _do_svg,
+        "stex": _do_stex,
+        "lean": _do_lean,
+        "pyramid": _do_pyramid,
+        "imageserve": _do_imageserve,
+        "scikgtex": _do_scikgtex,
+        "skill": _do_skill,
+        "steps": _do_steps,
+        "retrieve": _do_retrieve,
+        "okf": _do_okf,
+        "occurrences": _do_occurrences,
+        "context": _do_context,
+        "merge": _do_merge,
+        "fontspans": _do_fontspans,
+        "repoinit": _do_repoinit,
+        "publish": _do_publish,
+        "reconcile": _do_reconcile,
+        "combine": _do_combine,
+        "chatlog": _do_chatlog,
+        "remath": _do_remath,
+    }

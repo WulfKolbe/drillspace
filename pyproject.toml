@@ -1,0 +1,119 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfdrill"
+version = "0.1.0"
+description = "Token-economical drill-down extraction + PDF->LaTeX OCR quality control"
+readme = "README.md"
+license = "LicenseRef-Prosperity-3.0.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "pdfminer.six>=20221105",
+    "pdfplumber>=0.11",
+    "pydantic>=2.0",
+    "pypdf>=4.0",
+]
+
+[project.optional-dependencies]
+# Scan acquisition (`pdfdrill scan`) — the VENDORED rig at pdfdrill.scandrill
+# (absorbed from the SCANDRILL project). These are its deps, now ours; the SANE
+# tools (`scanimage`) are a system package, see bootstrap.sh / doctor. Absent →
+# `scan` degrades to a hint, every other route is unaffected.
+scan = [
+    "img2pdf>=0.5",     # lossless image → PDF (JPEG /DCTDecode verbatim, no re-encode)
+    "pikepdf>=8",       # /Lang, page labels, metadata — no pixel touch
+    "Pillow>=10",       # page dimensions + blank-mean measurement
+]
+nlp = ["stanza>=1.10"]
+# Canonical math layer (the `mathlayer` package): LaTeX→SymPy→multi-backend.
+math = ["sympy>=1.12", "latex2sympy2_extended>=1.11"]
+# Additive commercial-document feature extractors (the `features` package).
+# networkx + rapidfuzz are the core; the rest back individual extractors and
+# are imported lazily (each extractor degrades to [] when its lib is absent).
+features = [
+    "networkx>=3.0",
+    "rapidfuzz>=3.0",
+    "dateparser>=1.2",
+    "phonenumbers>=8.13",
+    "price-parser>=0.3.4",
+    "probablepeople>=0.5.5",
+    "usaddress>=0.5.10",
+    "email-validator>=2.0",
+]
+# Layout-element GNN (the vendored `pdfdrill.tsv_gcn`): a pure-NumPy
+# geometric-attention model over tesseract word boxes that isolates addresses /
+# BOM line items as content-addressed tiddlers (`pdfdrill elements`). numpy is
+# required for the GNN; blake3 is optional (content_hash falls back to sha256).
+# The vendored `pdfdrill.extract_addresses` heuristic (no-model address path) is
+# pure-stdlib — no extra needed. libpostal/pypostal (`postal`) is an OPTIONAL
+# upgrade that PARSES a found address block into components; it's wired as an
+# enrichment step (auto-used when present; the .so is ctypes-preloaded from
+# /usr/local/lib so it works without ldconfig/root). Install: build libpostal
+# from source, then `pip install postal`. Not declared here (the C-lib build is
+# not pip-installable); pdfdrill degrades silently to the raw block when absent.
+layout = [
+    "numpy>=1.24",
+    "blake3>=0.4",
+]
+# QR / barcode scanning (`pdfdrill qr`): GiroCode/EPC payment QR + Data Matrix
+# franking marks as confirmation data. zxing-cpp is the decode engine; pages are
+# rasterized with Ghostscript (>=400 DPI; the only rasterizer, no PyMuPDF). Degrades cleanly.
+qr = [
+    "zxing-cpp>=2.0",
+]
+# Local MathPix-free image server (tools/imageserver/ + src/pdfdrill/eqcrop.py):
+# a 600-DPI Ghostscript DZI pyramid serves the cdn.mathpix.com crops + a deep-zoom
+# viewer locally. Pillow does the region crops; pyvips (libvips) does the dzsave
+# tiling for `pdfdrill pyramid`. gs is already a hard requirement.
+# pyvips[binary] pulls a wheel that BUNDLES libvips, so `pip install
+# 'pdfdrill[imageserver]'` works with NO system package / no root. If you prefer
+# the system lib, `apt-get install libvips-tools` (bootstrap.sh does) + plain pyvips.
+imageserver = [
+    "pillow>=10.0",
+    "pyvips[binary]>=2.2",
+]
+# Language detection accuracy upgrade (features.extract_language). Without it the
+# pure-Python stopword fallback (or langdetect, if present) is used — detection
+# always works offline. lingua is best on short/mixed text.
+lang = [
+    "lingua-language-detector>=2.0",
+    "langdetect>=1.0",
+]
+# Hunspell-backed spellcheck + de-hyphenation QC (pdfdrill.spellqc). pyenchant
+# wraps libhunspell (best where it has the language, e.g. en_US). spylls is the
+# pure-Python Hunspell — reads .aff/.dic with no C build/binding, ideal for a
+# locked-down sandbox (vendor it / it has no install-time C deps). The pure
+# .dic-word-set floor needs neither. German needs de_DE.{aff,dic} on disk.
+spell = [
+    "pyenchant>=3.2",
+    "spylls>=0.1.7",
+]
+# Visual font identification for scanned input (pdfdrill.font_classify): the
+# torch-free storia/font-classify ONNX path — onnxruntime + opencv + pyyaml only
+# (NO torch/timm/huggingface_hub). The ~61 MB model is fetched on demand to
+# $FONT_CLASSIFY_DIR / ~/.cache/pdfdrill. Google-Fonts classes only.
+fontid = [
+    "onnxruntime>=1.16",
+    "opencv-python-headless>=4.8",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+pdfdrill = "pdfdrill.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pdfdrill*", "docmodel*", "docops*", "features*", "semantic*", "vocabnet*"]
+
+[tool.setuptools.package-data]
+# the bundled font-category table (offline; built by tools/build_font_categories.py),
+# the skillsync-generated --help body, and the complete bundled SKILL folder
+# (commands.yaml manifest + SKILL.md) so `pdfdrill skill` works from an installed wheel.
+pdfdrill = ["font_categories.json", "_help_generated.txt", "skill/*",
+            # the vendored acquisition rig's config — it documents the fixed rig
+            # (ADF Duplex @300dpi, deskew on) and must travel WITH the package,
+            # since there is no project root to search upward to once installed.
+            "scandrill/scandrill.toml"]

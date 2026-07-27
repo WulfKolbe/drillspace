@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# CodeGraph index (local)
+.codegraph/
+
+# pdfdrill sidecars + heavy blobs (regenerated next to each PDF)
+*.drill.json
+*.drill/
+
+# MCP / drillbatch download + resource caches
+.mcp-pdfcache/
+tools/.mcp-pdfcache/
+_pdfcache/
+
+# Generated unified-model artifacts
+*.docmodel.json
+
+# Source documents / OCR payloads (large, license-bound) — keep fixtures under tests/
+/data/*.pdf
+/data/*.lines.json
+/data/*.tex.zip
+/data/*.tgz
+/data/*.tar.gz
+/data/*.tex
+/data/*.md
+/data/*.drill.json
+/data/*.drill/
+
+# Secrets — keys live in .env (git-ignored); .env.example is committed.
+# mathpix_creds.py / perplexity_creds.py are now secret-free (read from env)
+# and ARE tracked. NOTE: their old secret-bearing blobs remain in git history
+# — purge (git-filter-repo/BFG) and ROTATE keys before going public.
+.env
+mtestzx.ts
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# drillspace: local workspace artifacts, not part of the playground
+.cursor/
+/resume.sh
+/files*.zip
+
+# drillspace: derived char dumps are regenerable and were ~103 MB of the clone —
+# keeping them out is what makes "open the link and drill" fast.
+/*.chars.json
+
+# Python build artifacts
+*.egg-info/
+build/
+dist/
+/data/*.chars.json
+/data/*.docmodel.json
+
+# regenerable cross-document artifacts in the corpus folder
+/data/*.semantic.json
+/data/*.rulebook.md
+/data/*.tgz
+/data/*.md
+
+# vocabnet (src/vocabnet/): downloaded vocabularies are licence-bound and the
+# compiled indexes are regenerable — both stay out of git. Only the converters
+# (src/vocabnet/) and the committed STUB.md / README.md under vocab/ are tracked.
+/vocab/compiled/
+/vocab/sources/*/*
+!/vocab/sources/*/STUB.md

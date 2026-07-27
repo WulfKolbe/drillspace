@@ -1,0 +1,203 @@
+# drillui — ask-the-document terminal
+
+**There is exactly ONE canonical copy of each file, and it lives in `tools/`.**
+If you find a `drillui_bridge.ts` / `drillui_term.html` anywhere else (e.g. an
+old `~/Downloads/` drop), it is a stale duplicate — delete it and use the repo
+copy. (Prerequisite: the Python deps must be installed once — `pip install -e .`
+in the repo; otherwise the bridge's `python -m pdfdrill` subprocess fails with
+e.g. `No module named 'pydantic'`.)
+
+Three files, three distinct roles. They are **not** interchangeable; the
+confusion comes from the shared `drillui_` prefix, so here is exactly what each
+one is and how they connect.
+
+```
+ browser tab                     one Bun process                  one Python process
+┌────────────────────┐  WebSocket ┌────────────────────┐  stdin/  ┌────────────────────┐
+│ drillui_term.html  │◄──────────►│ drillui_bridge.ts  │◄────────►│ drillui_chat.py    │
+│ (xterm.js UI)      │  /ws + HTTP│ (Bun: spawn + serve)│  stdout  │ (REPL: the brain)  │
+└────────────────────┘            └────────────────────┘          └─────────┬──────────┘
+                                                                             │ subprocess
+                                                                             ▼
+                                                                      pdfdrill (CLI)
+```
+
+- **`drillui_chat.py`** — the **brain** (Python). A REPL over ONE document: it
+  asks `pdfdrill retrieve` for grounded context, sends the enriched prompt to an
+  LLM (`claude -p`), and stores the Q&A back via `pdfdrill chatlog`. It also runs
+  any pdfdrill subcommand on the open doc by name. **It never needs a browser**
+  and works standalone in a terminal. It auto-locates `pdfdrill` from its own
+  path (`../src`), so no `--src` is required inside the repo.
+- **`drillui_bridge.ts`** — the **bridge** (Bun). A browser can't spawn a
+  process, so the bridge spawns ONE `drillui_chat.py <doc>` per WebSocket
+  connection and pipes stdin/stdout. It also serves `drillui_term.html`, serves
+  the files pdfdrill writes (`/artifact`), and can open a file in the host
+  browser (`/open`). **No business logic lives here** — it is plumbing.
+- **`drillui_term.html`** — the **UI** (browser). An xterm.js terminal with
+  bash-style line editing + history, a retrieval rail (cited unit ids), and an
+  Outputs panel (links to reports). It owns the visible prompt.
+
+## Run it (zero config; launch from anywhere)
+
+```bash
+bun tools/drillui_bridge.ts data/yourpaper.pdf      # then open http://localhost:8787/
+bun tools/drillui_bridge.ts                         # OR start EMPTY, then `add` docs in the UI
+cd tools && bun run drillui_bridge.ts               # also fine — launch location no longer matters
+```
+
+The bridge self-locates the repo root from its own path, so the artifacts root +
+served files are correct no matter where you launch it (an earlier version used
+the launch cwd, so running from `tools/` served the wrong folder).
+
+The document is **optional** — start empty and bring documents in with `add`.
+`add` is multi-document (a drillui function, not pdfdrill):
+
+- `add <pdf|url|arxiv-id>` — one doc.
+- `add a.pdf https://arxiv.org/abs/2501.06699 2412.00001` — several at once.
+- `add @list.txt` — every path/URL/arXiv-id listed in a file (one per line, `#`
+  comments and blank lines skipped) — for the hundreds-of-URLs case.
+
+### `scan` — bring in PAPER
+
+`scan [job] [--simplex]` acquires a stack from the scanner's ADF and adds the
+resulting PDF, so paper enters the context exactly like a file does.
+
+drillui owns none of this: it runs **`pdfdrill scan --json`** and hands the PDF
+to `add`. pdfdrill owns the acquisition outright — the rig lives vendored at
+`src/pdfdrill/scandrill/` (ADF duplex @300dpi, deskew measured then applied,
+`raw/` retained, blank sides recorded rather than deleted). Needs the `[scan]`
+extra + `scanimage`. So `scan` also works as a plain CLI command:
+`pdfdrill scan [job] [--from-dir D] [--out-dir D] [--simplex] [--no-deskew]`.
+
+- `job` names the ACQUISITION EVENT and defaults to a timestamp
+  (`scan-20260716-1430`) — correct here, because one stack through the feeder
+  really is identified by when it happened. It is **not** the document prefix:
+  one stack is usually several documents, so the per-document
+  `sender-date-type` bibkey is derived later, after segmentation.
+- **No OCR text layer is ever added on this path.** An underlay would make
+  pdfdrill's `route` read the scan as born-digital and send it to pdfminer
+  instead of the vision lane. The searchable underlay is a *human* deliverable
+  and is produced separately. Verified on a live ADF scan: 4 sides → 1 blank
+  recorded → 3 pages assembled lossless → `route` reports `scanned → Gemma 4`.
+
+The first `add` becomes the context; each further `add` merges in. **With more
+than one document loaded, a pdfdrill command runs on EVERY loaded document**
+(e.g. `tiddlers` fans out over all of them, printing a `=== name ===` header per
+doc); questions still retrieve across the whole combined set, and `bibtex` reads
+the combined store. (Each doc is still acquired by pdfdrill from its URL/id —
+drillui never fetches a PDF or LaTeX itself.)
+
+That's all: the bridge finds `drillui_chat.py` as its sibling, `python3` runs
+it, and `drillui_chat.py` finds `pdfdrill` in `../src`. Flags only if you need
+them: `--port N`, `--host ADDR`, `--model NAME`, `--k N`, `--no-store`,
+`--python BIN`, `--chat PATH` (only if the .py is elsewhere),
+`--opener firefox|xdg-open` / `--no-open`.
+
+### Reaching drillui from another machine
+
+The bridge binds **`0.0.0.0`** by default, so the UI is reachable from any device
+on your network. The startup log prints the exact address to type there —
+`localhost` on another machine points at *that* machine, not this one:
+
+```
+drillui bridge → http://localhost:8787/
+  on your network → http://192.168.178.67:8787/     ← use this on your phone/laptop
+```
+
+`--host 127.0.0.1` (or `DRILLUI_HOST=127.0.0.1`) restricts it back to this
+machine. Worth knowing before you expose it: on `0.0.0.0` anyone who can reach
+the port gets the terminal, the artifact file routes and the LLM — there is no
+authentication. Fine on a trusted home LAN; use `--host 127.0.0.1` (plus an SSH
+tunnel) on anything you don't control.
+
+**Firewall.** Binding is not enough — the port must also be *allowed*:
+`sudo ufw allow 8787` and `sudo ufw allow 10000` (the bridge and its static
+artifact server). Both directions matter: outgoing on the server, incoming on
+the client.
+
+### Where is the client? (this decides what "open a file" can mean)
+
+The bridge and the browser are not always on the same machine, and **everything
+file-related depends on which**. The bridge detects it from the connection's
+source address and adapts:
+
+| | browser **on the server** (localhost, or `beelink:8787` typed on beelink) | browser on **another device** (laptop/phone) |
+|---|---|---|
+| `/artifact`, static links | work | work — this is the only route that does |
+| `open <file>` | host browser opens on your screen | opens in **your** browser via `http://…` |
+| host-open (`/open`) | available | **disabled** — it would open a window on the *server* |
+| `edit <file>` (gummi) | available | **disabled** — the editor would launch on the *server* |
+| a local path / `file://` | resolves | meaningless — it addresses **your** disk, not the server's |
+
+Ask the bridge directly:
+
+```bash
+curl -s http://beelink:8787/whoami | python3 -m json.tool
+```
+
+```json
+{ "clientIp": "192.168.178.42", "local": false,
+  "serverHostname": "beelink", "serverAddresses": ["192.168.178.67"],
+  "hostOpen": false, "editor": null,
+  "artifactBase": "http://beelink:8787/artifact?path=",
+  "note": "different machine: use http:// artifact URLs — host-open/edit would act on the server, …" }
+```
+
+The terminal shows the same fact: the location chip reads `beelink:8787 · remote`
+or `· same machine`, and a remote session prints one notice on connect. A remote
+client is never *told* host-open/edit exist, so it falls back to opening the
+artifact URL in its own browser — instead of silently doing nothing because the
+window appeared on the server.
+
+The document must already be drilled (`pdfdrill model <doc>`). If it isn't, the
+REPL says so on connect and tells you to type `model` to build it.
+
+## What happens to a line you type — the command model
+
+The browser decides FIRST, then (only if not local) forwards to Python:
+
+| You type | Handled by | Effect |
+|---|---|---|
+| `open <url\|file>` | **browser (local)** | opens a new window — a URL directly, or a pdfdrill output file via the bridge. **Never an LLM call.** |
+| `lhelp` | **browser (local)** | lists the local commands |
+| `^L` | **browser (local)** | clear screen |
+| `status`, `size`, `model`, `report`, `mathpix`, `visionocr`, … | Python → pdfdrill | runs that pdfdrill subcommand **on the open doc** (filename auto-filled) |
+| `quit` / `exit` / `q` | Python | quits the REPL |
+| anything else | Python → LLM | a grounded **question** about the document |
+
+So `open https://arxiv.org/pdf/2305.04710` opens the PDF in a window; it does
+**not** go to the LLM. This is the fix for the earlier "open url called Claude".
+
+## Importing tiddlers into TiddlyWiki — drag & drop (no file browser)
+
+A `*.tiddlers.json` (or any tiddler-array JSON) in the **Outputs** panel is
+**draggable straight into an open TiddlyWiki tab**: it shows `⇲ drag → TiddlyWiki`,
+and on drop TiddlyWiki imports it via its native `text/vnd.tiddler` type — **no
+file browser, no import menu** (the same mechanism TW uses to drag tiddlers
+between wikis and to install plugins). drillui pre-fetches the JSON so the drag
+carries the actual tiddler array; drop it onto the TiddlyWiki window and confirm
+the import.
+
+Each Outputs row also has **`save ⤓`** — it downloads the REAL file (valid JSON,
+correct name) to your browser's download dir. Use it when you'd rather drag the
+saved file in: clicking `open ↗` shows the browser's collapsible JSON *viewer*,
+whose text can't be copied as valid JSON — `save ⤓` gives you the actual file.
+
+Two equivalent paths if you prefer the OS:
+- The artifacts live under `~/Downloads/<name>.pdf.drill/` (the config download
+  dir, never `/tmp`), so you can also drag the `*.tiddlers.json` **file** from the
+  file manager onto TiddlyWiki — same native import.
+- The dumb TiddlyWiki *file-input* browser is avoidable entirely; never paste the
+  `…/artifact?path=…` URL into it.
+
+## Test it
+
+```bash
+bun tools/test_drillui_bridge.ts data/1906.02691.pdf
+```
+
+Spawns the real bridge against a drilled doc and checks: the page serves, the
+`open`-is-local contract holds (promptLoop intercepts before forwarding),
+`/artifact` serves under-root files and refuses traversal, `/open` is refused
+when host-open is disabled, and a WebSocket round-trip runs a `status` command
+on the doc and gets output back.
