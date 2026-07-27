@@ -1,6 +1,6 @@
 # drillspace — the pdfdrill playground
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/WulfKolbe/drillspace?quickstart=1)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/WulfKolbe/drillspace)
 
 **Two clicks, then drill.** Click the badge, wait for the codespace, and
 **drillui opens in your browser** on a sample paper that is already drilled —
