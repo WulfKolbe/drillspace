@@ -21,6 +21,28 @@ bash .devcontainer/start-drillui.sh            # the bundled sample
 DRILLUI_DOC=my.pdf bash .devcontainer/start-drillui.sh
 ```
 
+### A document that does *not* drill cleanly
+
+Most samples here take the happy path. This one does not, and is worth trying
+because the failure is the interesting part:
+
+```bash
+python3 -m pdfdrill model https://ftp.gwdg.de/pub/ctan/graphics/pstricks/contrib/pst-knot/pst-knot-doc.pdf
+```
+
+Eight pages of PostScript-generated graphics: a text layer exists but is
+semantically empty, so the model builds with correct page geometry and no
+resolved content — `inspect` renders the right page frames, empty. Recover it
+with a raster pass, then look again:
+
+```bash
+python3 -m pdfdrill ocr pst-knot-doc.pdf --force   # tesseract over rendered pages
+python3 -m pdfdrill inspect pst-knot-doc.pdf       # now the elements resolve
+```
+
+MathPix (`pdfdrill mathpix <pdf> --force`) is the better answer for pages this
+graphics-heavy, if you have keys.
+
 If something misbehaves: `bash .devcontainer/verify.sh` checks the toolchain
 and exits with the number of failures. Details in
 [`.devcontainer/README.md`](.devcontainer/README.md).
