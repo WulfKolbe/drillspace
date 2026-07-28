@@ -42,9 +42,24 @@
   "forwardPorts": [8787, 8080, 10000],
 
   "portsAttributes": {
+    // visibility public: a forwarded port defaults to private, which sends any
+    // plain browser tab through GitHub's pf-signin flow before it reaches
+    // drillui — and that hand-off fails often enough to have blocked the very
+    // first click. Setting it per-codespace with `gh codespace ports
+    // visibility` does NOT survive a stop/start (verified), and the container
+    // cannot set it itself: gh is not installed and the built-in token lacks
+    // the codespace scope. This file is the only place it persists.
+    //
+    // The trade-off is real: while a codespace runs, anyone holding its URL
+    // reaches drillui, which executes pdfdrill commands against the documents
+    // in that container. Acceptable here because drillspace is a public
+    // playground shipping sample papers, the URL is long and unguessable, and
+    // the codespace stops on idle. Change to "private" if that ever stops
+    // being true.
     "8787": {
       "label": "drillui (ask-the-document terminal)",
-      "onAutoForward": "openBrowser"
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
     },
     "8080": {
       "label": "TiddlyWiki (bun)",
