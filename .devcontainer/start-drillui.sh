@@ -53,6 +53,22 @@ disown 2>/dev/null || true
 
 # Confirm it actually bound, rather than reporting success and leaving the user
 # to discover otherwise. This is the check that was missing.
+make_public() {
+  # Returns 0 only if port 8787 is actually public afterwards.
+  #
+  # Needs a token with the `codespace` scope in CODESPACE_PORTS_TOKEN, added as
+  # a Codespaces secret. The built-in GITHUB_TOKEN is deliberately NOT tried:
+  # it lacks the scope, so using it would produce a misleading failure.
+  [ -n "${CODESPACE_PORTS_TOKEN:-}" ] || return 1
+  [ -n "${CODESPACE_NAME:-}" ] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  GH_TOKEN="$CODESPACE_PORTS_TOKEN" \
+    gh codespace ports visibility 8787:public -c "$CODESPACE_NAME" >/dev/null 2>&1 || return 1
+  GH_TOKEN="$CODESPACE_PORTS_TOKEN" \
+    gh codespace ports -c "$CODESPACE_NAME" 2>/dev/null | grep -q '^.*8787[[:space:]]*public' || return 1
+  return 0
+}
+
 announce() {
   # Inside a codespace, http://localhost:8787 on the VISITOR's machine is their
   # own machine, not this container — the only address that works is the
@@ -79,13 +95,23 @@ announce() {
   printf '  │  drillui is running on port 8787.                            │\n'
   printf '  └──────────────────────────────────────────────────────────────┘\n'
   printf '\n'
-  printf '  COPY the address below and PASTE it into a new browser tab:\n'
-  printf '\n    %s\n\n' "$url"
-  printf '  Do NOT ctrl/cmd-click it, and do not use the PORTS tab button or\n'
-  printf '  the notification. Every click path is rewritten by VS Code into a\n'
-  printf '  much longer .../pf-signin?... URL — a sign-in hand-off that fails\n'
-  printf '  in some browsers and lands on a forwarding error. The plain\n'
-  printf '  address above bypasses it and just works.\n'
+  if make_public; then
+    printf '  drillui is PUBLIC on this address — open it in any browser:\n'
+    printf '\n    %s\n\n' "$url"
+    printf '  Clicking is fine now that the port is public.\n'
+  else
+    printf '  COPY the address below and PASTE it into a new browser tab:\n'
+    printf '\n    %s\n\n' "$url"
+    printf '  Do NOT ctrl/cmd-click it, and do not use the PORTS tab button.\n'
+    printf '  Every click path is rewritten by VS Code into a much longer\n'
+    printf '  .../pf-signin?... URL — a sign-in hand-off that fails in some\n'
+    printf '  browsers. The plain address above bypasses it.\n'
+    printf '\n'
+    printf '  To make clicking work too, add a Codespaces secret named\n'
+    printf '  CODESPACE_PORTS_TOKEN (a token with the `codespace` scope) at\n'
+    printf '  https://github.com/settings/codespaces — this script then sets\n'
+    printf '  the port public on every start.\n'
+  fi
   printf '\n'
   printf '  (localhost:8787 will NOT work from your own browser — that\n'
   printf '   address is this container, not your machine.)\n\n'

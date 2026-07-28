@@ -191,6 +191,31 @@ else
     || echo "  !! claude NOT installed — pdfdrill commands still work; questions will not."
 fi
 
+# ---- 7c/8  gh CLI (used to make port 8787 public) -----------------------
+# A forwarded port is private by default, and every CLICK path to a private
+# port is rewritten by VS Code into a .../pf-signin?... hand-off that fails in
+# some browsers. Making the port public removes that hand-off entirely.
+#
+# Nothing else can do it: "visibility" in devcontainer.json is ignored, and
+# setting it per-codespace does not survive a stop/start. So the container has
+# to set it on every start — which needs gh plus a token carrying the
+# `codespace` scope (the built-in GITHUB_TOKEN does not have it).
+step "7c/8  gh CLI"
+if command -v gh >/dev/null 2>&1; then
+  echo "  gh already present: $(gh --version | head -1)"
+else
+  $SUDO apt-get install -y -q gh 2>/dev/null \
+    || curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         | $SUDO dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null 2>&1 \
+    && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null 2>&1 \
+    && $SUDO apt-get update -q >/dev/null 2>&1 \
+    && $SUDO apt-get install -y -q gh >/dev/null 2>&1
+  command -v gh >/dev/null 2>&1 \
+    && echo "  gh $(gh --version | head -1)" \
+    || echo "  (gh install failed — port 8787 will stay private)"
+fi
+
 # ---- 8/8  suppress the README preview on open ---------------------------
 # devcontainer.json's customizations.vscode.settings land in MACHINE scope, and
 # `workbench.startupEditor` is a USER-scope setting — VS Code silently ignores
