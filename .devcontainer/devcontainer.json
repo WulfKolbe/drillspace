@@ -42,8 +42,16 @@
   "forwardPorts": [8787, 8080, 10000],
 
   "portsAttributes": {
-    // "notify", NOT "openBrowser" — and no "visibility" key. Both were tried
-    // and measured, so do not reinstate them without new evidence:
+    // "silent" — deliberately offering the visitor NO button, because every
+    // button is broken. VS Code rewrites any click on this port (terminal
+    // link, PORTS tab globe, notification action) into a long
+    // .../pf-signin?...&pb=... hand-off, and that hand-off dead-ends on a
+    // forwarding error in some browsers. The plain forwarded address, pasted
+    // into a tab by hand, works — so the terminal banner tells the visitor to
+    // COPY it rather than click anything. A notification would only put a
+    // failing button in front of them.
+    //
+    // The history behind the two settings NOT used here:
     //
     //   - "visibility": "public" reaches the merged devcontainer config but is
     //     never applied. Verified on a clean attach, with the bridge opening
@@ -59,13 +67,14 @@
     //     failed repeatedly in a real browser, landing on a forwarding error
     //     instead of drillui.
     //
-    // "notify" raises a toast carrying VS Code's own authenticated open path
-    // — the same route as the Ports panel's "Open in Browser", which is the
-    // one thing observed to work every time. One click, and it comes to the
-    // visitor instead of being buried in a panel they have to know about.
+    //   - "notify" was the next attempt, on the theory that the Ports panel's
+    //     button was an authenticated path that worked where openBrowser did
+    //     not. It is not a different path: the panel button, the notification
+    //     action and a ctrl-click on the terminal link all go through the same
+    //     rewrite, and all three produced the same forwarding error.
     "8787": {
       "label": "drillui (ask-the-document terminal)",
-      "onAutoForward": "notify"
+      "onAutoForward": "silent"
     },
     "8080": {
       "label": "TiddlyWiki (bun)",
