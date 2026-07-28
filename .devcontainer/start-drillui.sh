@@ -76,11 +76,20 @@ announce() {
   fi
   printf '\n'
   printf '  ┌──────────────────────────────────────────────────────────────┐\n'
-  printf '  │  drillui is running. Open it here:                           │\n'
+  printf '  │  drillui is running on port 8787.                            │\n'
   printf '  └──────────────────────────────────────────────────────────────┘\n'
+  printf '\n'
+  printf '  OPEN IT: the PORTS tab (next to TERMINAL) → the 8787 row →\n'
+  printf '           the globe icon, or right-click → "Open in Browser".\n'
+  printf '\n'
+  printf '  A notification with the same button should also appear shortly.\n'
+  printf '\n'
+  printf '  Use one of those, NOT the raw URL below: the port is private, so\n'
+  printf '  a plain tab is sent through a GitHub sign-in hand-off that often\n'
+  printf '  fails. VS Code opens it already authenticated.\n'
   printf '\n    %s\n\n' "$url"
-  printf '  (ctrl/cmd-click the link. localhost:8787 will NOT work from your\n'
-  printf '   own browser — that address is this container, not your machine.)\n\n'
+  printf '  (localhost:8787 will NOT work from your own browser — that\n'
+  printf '   address is this container, not your machine.)\n\n'
 }
 
 for _ in $(seq 1 20); do

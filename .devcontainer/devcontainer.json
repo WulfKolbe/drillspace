@@ -42,24 +42,30 @@
   "forwardPorts": [8787, 8080, 10000],
 
   "portsAttributes": {
-    // visibility public: a forwarded port defaults to private, which sends any
-    // plain browser tab through GitHub's pf-signin flow before it reaches
-    // drillui — and that hand-off fails often enough to have blocked the very
-    // first click. Setting it per-codespace with `gh codespace ports
-    // visibility` does NOT survive a stop/start (verified), and the container
-    // cannot set it itself: gh is not installed and the built-in token lacks
-    // the codespace scope. This file is the only place it persists.
+    // "notify", NOT "openBrowser" — and no "visibility" key. Both were tried
+    // and measured, so do not reinstate them without new evidence:
     //
-    // The trade-off is real: while a codespace runs, anyone holding its URL
-    // reaches drillui, which executes pdfdrill commands against the documents
-    // in that container. Acceptable here because drillspace is a public
-    // playground shipping sample papers, the URL is long and unguessable, and
-    // the codespace stops on idle. Change to "private" if that ever stops
-    // being true.
+    //   - "visibility": "public" reaches the merged devcontainer config but is
+    //     never applied. Verified on a clean attach, with the bridge opening
+    //     the port while VS Code was watching: the port stayed private and an
+    //     unauthenticated fetch still got GitHub's sign-in page. Codespaces
+    //     does not honour it here. Setting it with `gh codespace ports
+    //     visibility` works but does not survive a stop/start, and the
+    //     container cannot set it for itself (no gh, and the built-in token
+    //     has no codespace scope).
+    //
+    //   - "openBrowser" opens the forwarded URL in a plain tab, which for a
+    //     private port means GitHub's pf-signin hand-off — and that hand-off
+    //     failed repeatedly in a real browser, landing on a forwarding error
+    //     instead of drillui.
+    //
+    // "notify" raises a toast carrying VS Code's own authenticated open path
+    // — the same route as the Ports panel's "Open in Browser", which is the
+    // one thing observed to work every time. One click, and it comes to the
+    // visitor instead of being buried in a panel they have to know about.
     "8787": {
       "label": "drillui (ask-the-document terminal)",
-      "onAutoForward": "openBrowser",
-      "visibility": "public"
+      "onAutoForward": "notify"
     },
     "8080": {
       "label": "TiddlyWiki (bun)",
