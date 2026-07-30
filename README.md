@@ -30,18 +30,31 @@ because the failure is the interesting part:
 python3 -m pdfdrill model https://ftp.gwdg.de/pub/ctan/graphics/pstricks/contrib/pst-knot/pst-knot-doc.pdf
 ```
 
-Eight pages of PostScript-generated graphics: a text layer exists but is
-semantically empty, so the model builds with correct page geometry and no
-resolved content — `inspect` renders the right page frames, empty. Recover it
-with a raster pass, then look again:
+Eight pages of PostScript-generated graphics. A text layer exists and is *thin*,
+not empty: the born-digital route resolves **8 elements — one Paragraph per
+page**, each a whole page of prose and LaTeX examples run together in one blob,
+with no headings, tables or equations. The math fonts are right there in the font
+layer (`CMMI10`) and nothing typed comes out. Recover the structure with a raster
+pass, then look again:
 
 ```bash
 python3 -m pdfdrill ocr pst-knot-doc.pdf --force   # tesseract over rendered pages
-python3 -m pdfdrill inspect pst-knot-doc.pdf       # now the elements resolve
+python3 -m pdfdrill inspect pst-knot-doc.pdf       # 119 elements instead of 8
 ```
 
-MathPix (`pdfdrill mathpix <pdf> --force`) is the better answer for pages this
-graphics-heavy, if you have keys.
+That is real structure — 109 Paragraph, 2 Table, 8 Equation *regions* — but the
+equation text is garbled, because tesseract does not read math.
+
+Neither free route sees the knots. They are vector (293 curves, 57 lines), so
+there is no image to extract: `pdfimages` reports 492 entries and every one is a
+1×1 stencil mask of 1 byte, a dvips painting artifact. MathPix
+(`pdfdrill mathpix <pdf> --force`) is the only route that resolves them, as 24
+`Diagram` nodes — and note it returns *fewer* elements than OCR, 79, while being
+the better model. Counting nodes measures how hard a route chopped the page, not
+how much it understood.
+
+Measured with pdfdrill 0.4.0 and tesseract 5.3.4; counts are the inspector's own
+badge. Walked through at <https://pdfdrill.github.io/#ocr>.
 
 If something misbehaves: `bash .devcontainer/verify.sh` checks the toolchain
 and exits with the number of failures. Details in
