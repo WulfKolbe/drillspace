@@ -60,6 +60,22 @@ If something misbehaves: `bash .devcontainer/verify.sh` checks the toolchain
 and exits with the number of failures. Details in
 [`.devcontainer/README.md`](.devcontainer/README.md).
 
+### Three drills already done, in one wiki
+
+`audit/pdfdrill-audit.html` is a single-file TiddlyWiki holding three documents
+already drilled by different routes — an arXiv paper with LaTeX-gold source, a
+PDF-only arXiv submission with no LaTeX, and a scanned US reissue patent. Each
+one's `inspect` and `report` output is stored as a tiddler and opens **inside**
+the wiki rather than as a separate file.
+
+```bash
+python3 -m http.server 8000 --directory audit
+```
+
+Then open `pdfdrill-audit.html` on the forwarded port and search
+`results/USRE41428.inspect` — the scanned patent, the hardest of the three.
+See [`audit/README.md`](audit/README.md).
+
 ## Forwarded ports
 
 | Port | What |
