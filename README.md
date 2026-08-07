@@ -64,17 +64,20 @@ and exits with the number of failures. Details in
 
 `audit/pdfdrill-audit.html` is a single-file TiddlyWiki holding three documents
 already drilled by different routes — an arXiv paper with LaTeX-gold source, a
-PDF-only arXiv submission with no LaTeX, and a scanned US reissue patent. Each
-one's `inspect` and `report` output is stored as a tiddler and opens **inside**
-the wiki rather than as a separate file.
+PDF-only arXiv submission with no LaTeX, and a scanned US reissue patent. Where
+`inspect` or `report` output exists it is stored as a tiddler and opens
+**inside** the wiki rather than as a separate file.
 
 ```bash
 python3 -m http.server 8000 --directory audit
 ```
 
 Then open `pdfdrill-audit.html` on the forwarded port and search
-`results/USRE41428.inspect` — the scanned patent, the hardest of the three.
-See [`audit/README.md`](audit/README.md).
+`results/1012.3259.inspect` — the PDF-only submission, with no LaTeX to check
+the extraction against. See [`audit/README.md`](audit/README.md).
+
+The same file is served at <https://pdfdrill.github.io/pdfdrill-audit.html> if
+you would rather not start a Codespace for it.
 
 ## Forwarded ports
 
